@@ -1,0 +1,100 @@
+name: Release
+
+# Publishes to PyPI when a version tag is pushed.
+#
+# Uses Trusted Publishing (OIDC) rather than a stored API token: PyPI verifies
+# the workflow identity directly, so there is no long-lived credential in repo
+# secrets to leak or rotate.
+#
+# One-time setup on PyPI (Publishing → Add a new pending publisher):
+#   PyPI project name : justonce
+#   Owner             : abhisheksharma2411
+#   Repository        : justonce
+#   Workflow          : release.yml
+#   Environment       : pypi
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify before publishing
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: justonce_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s
+          --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev,postgres]"
+      - run: ruff check src tests
+      - name: Full suite including Postgres conformance
+        env:
+          JUSTONCE_POSTGRES_DSN: postgresql://postgres:postgres@localhost:5432/justonce_test
+        run: pytest -q
+
+  build:
+    name: Build distributions
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+
+      - name: Install the built wheel in a clean environment and use it
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          /tmp/clean/bin/python - <<'PY'
+          import justonce
+          from justonce.stores import SqliteStore
+          justonce.configure(SqliteStore(":memory:"))
+          calls = []
+          @justonce.idempotent(key=lambda i: justonce.operation_key("charge", i))
+          def charge(i):
+              calls.append(i)
+              return {"id": len(calls)}
+          charge("o1"); charge("o1"); charge("o1")
+          assert len(calls) == 1, f"expected 1 effect, got {len(calls)}"
+          print("wheel smoke test passed")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/justonce
+    permissions:
+      id-token: write   # required for Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
