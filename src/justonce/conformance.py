@@ -20,9 +20,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from .stores.base import State, Store
+from .stores.base import Record, State, Store
 
 TTL = 60.0
+
+
+def _found(record: Record | None) -> Record:
+    """Narrow an Optional lookup, failing the test if the record is missing."""
+    assert record is not None, "expected a record for this key, store returned None"
+    return record
 
 
 class StoreConformanceTests:
@@ -63,13 +69,13 @@ class StoreConformanceTests:
         store = self.make_store()
         claim = store.claim("k", "h", TTL)
         assert claim.won
-        assert store.lookup("k").state is State.IN_PROGRESS
+        assert _found(store.lookup("k")).state is State.IN_PROGRESS
 
     def test_complete_records_response(self) -> None:
         store = self.make_store()
         store.claim("k", "h", TTL)
         store.complete("k", {"charge_id": "ch_1"})
-        record = store.lookup("k")
+        record = _found(store.lookup("k"))
         assert record.state is State.SUCCEEDED
         assert record.response == {"charge_id": "ch_1"}
 
@@ -79,13 +85,13 @@ class StoreConformanceTests:
         store.complete("k", {"charge_id": "ch_1"})
         claim = store.claim("k", "h", TTL)
         assert claim.lost
-        assert claim.record.response == {"charge_id": "ch_1"}
+        assert _found(claim.record).response == {"charge_id": "ch_1"}
 
     def test_terminal_failure_burns_the_key(self) -> None:
         store = self.make_store()
         store.claim("k", "h", TTL)
         store.fail("k", terminal=True)
-        assert store.lookup("k").state is State.FAILED
+        assert _found(store.lookup("k")).state is State.FAILED
         assert store.claim("k", "h", TTL).lost
 
     def test_transient_failure_releases_the_key(self) -> None:
@@ -100,7 +106,7 @@ class StoreConformanceTests:
         store = self.make_store()
         store.claim("k", "h", TTL)
         store.mark_unknown("k")
-        assert store.lookup("k").state is State.UNKNOWN
+        assert _found(store.lookup("k")).state is State.UNKNOWN
 
     def test_unknown_is_never_swept(self) -> None:
         """An unresolved outcome that gets swept is an untraceable duplicate."""
@@ -164,7 +170,7 @@ class StoreConformanceTests:
         """The divergence guard depends on this surviving a round trip."""
         store = self.make_store()
         store.claim("k", "fingerprint-abc", TTL)
-        assert store.lookup("k").request_hash == "fingerprint-abc"
+        assert _found(store.lookup("k")).request_hash == "fingerprint-abc"
 
     def test_keys_are_isolated(self) -> None:
         store = self.make_store()
@@ -176,4 +182,4 @@ def response_roundtrips(store: Store, value: Any) -> bool:
     """Helper for stores with unusual serialisation."""
     store.claim("rt", "h", TTL)
     store.complete("rt", value)
-    return store.lookup("rt").response == value
+    return bool(_found(store.lookup("rt")).response == value)

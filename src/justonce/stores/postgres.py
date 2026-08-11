@@ -146,7 +146,7 @@ class PostgresStore:
                 """,
                 (State.SUCCEEDED.value, State.FAILED.value, before),
             )
-            return cur.rowcount
+            return int(cur.rowcount)
 
     def unresolved(self, *, older_than: float | None = None, limit: int = 100) -> list[Record]:
         cutoff = older_than if older_than is not None else time.time()
@@ -183,7 +183,7 @@ class PostgresStore:
         return PostgresStore._row(row) if row else None
 
     @staticmethod
-    def _row(row: dict) -> Record:
+    def _row(row: dict[str, Any]) -> Record:
         return Record(
             key=row["key"],
             state=State(row["state"]),

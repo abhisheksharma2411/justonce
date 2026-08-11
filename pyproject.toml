@@ -55,6 +55,6 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 strict = true
 files = ["src/justonce"]

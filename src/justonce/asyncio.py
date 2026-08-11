@@ -22,7 +22,7 @@ import asyncio
 import functools
 import time
 from collections.abc import Awaitable
-from typing import Any, Callable, Protocol, TypeVar, runtime_checkable
+from typing import Any, Callable, Protocol, TypeVar, cast, runtime_checkable
 
 from .core import DEFAULT_RETENTION_SECONDS, DEFAULT_TTL_SECONDS, OnInFlight, Result
 from .errors import InFlightTimeout, KeyReuseError, OperationInFlightError
@@ -115,9 +115,10 @@ class AsyncIdempotent:
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
-        self.store: AsyncStore = (
-            store if _is_async_store(store) else ThreadedStore(store)  # type: ignore[arg-type]
-        )
+        if _is_async_store(store):
+            self.store: AsyncStore = cast("AsyncStore", store)
+        else:
+            self.store = ThreadedStore(cast("Store", store))
         self.ttl_seconds = ttl_seconds
         self.on_in_flight = on_in_flight
         self.wait_timeout = wait_timeout

@@ -14,7 +14,7 @@ from .sqlite import SqliteStore
 __all__ = ["Claim", "Record", "SqliteStore", "State", "Store"]
 
 
-def __getattr__(name: str):  # pragma: no cover - import shim
+def __getattr__(name: str) -> object:  # pragma: no cover - import shim
     # Postgres needs psycopg, which is an optional extra. Import lazily so the
     # base package installs with no database driver at all.
     if name == "PostgresStore":
