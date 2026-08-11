@@ -34,6 +34,7 @@ The duplicates that matter are the irreversible ones: money moves, an email send
 ```bash
 pip install justonce                 # SQLite included, no dependencies
 pip install justonce[postgres]       # + Postgres store
+pip install justonce[django]         # + Django store, uses your existing connection
 ```
 
 ## Usage
@@ -55,6 +56,21 @@ For a fleet, swap the store — nothing else changes:
 from justonce.stores import PostgresStore
 justonce.configure(PostgresStore("postgresql://localhost/app"))
 ```
+
+Already on Django? Use the connection you have, on any backend Django supports:
+
+```python
+from justonce.stores.django_store import DjangoStore
+justonce.configure(DjangoStore())
+```
+
+One caveat worth reading before you ship it: a store on the default alias joins
+your ambient `transaction.atomic()` block. That is correct when the effect is a
+local write — claim and effect roll back together. It is **wrong when the effect
+is an external call**, because a rollback erases the claim while the charge
+stands, and the retry charges again. Point the store at a separate database
+alias in that case, and `store.in_ambient_transaction()` will tell you which
+mode you are actually in.
 
 ### Knowing whether *this* call did the work
 
