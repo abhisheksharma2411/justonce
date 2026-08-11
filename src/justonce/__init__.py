@@ -14,6 +14,13 @@ processing produces exactly-once *effects*. You cannot stop the duplicate
 arriving — this library makes it harmless.
 """
 
+from .asyncio import (
+    AsyncIdempotent,
+    AsyncStore,
+    ThreadedStore,
+    async_idempotent,
+    configure_async,
+)
 from .core import (
     DEFAULT_RETENTION_SECONDS,
     DEFAULT_TTL_SECONDS,
@@ -37,6 +44,8 @@ __version__ = "0.1.0"
 __all__ = [
     "DEFAULT_RETENTION_SECONDS",
     "DEFAULT_TTL_SECONDS",
+    "AsyncIdempotent",
+    "AsyncStore",
     "Claim",
     "Idempotent",
     "InFlightTimeout",
@@ -49,8 +58,11 @@ __all__ = [
     "State",
     "Store",
     "StoreError",
+    "ThreadedStore",
     "__version__",
+    "async_idempotent",
     "configure",
+    "configure_async",
     "fingerprint",
     "get_default",
     "idempotent",
