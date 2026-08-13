@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import StoreError
-from .base import Claim, Record, State
+from .base import Claim, Record, State, decode_response
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS justonce_keys (
@@ -176,7 +176,7 @@ class SqliteStore:
             key=row["key"],
             state=State(row["state"]),
             request_hash=row["request_hash"],
-            response=json.loads(row["response"]) if row["response"] is not None else None,
+            response=decode_response(row["response"]),
             attempts=row["attempts"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
