@@ -72,6 +72,24 @@ stands, and the retry charges again. Point the store at a separate database
 alias in that case, and `store.in_ambient_transaction()` will tell you which
 mode you are actually in.
 
+
+### Choosing a store
+
+| Store | Use when | Not when |
+|---|---|---|
+| `SqliteStore` | single host — local dev, tests, a single-instance deployment | you're running more than one machine or worker process |
+| `PostgresStore` | a fleet of workers sharing state, no existing Django app | — |
+| `DjangoStore` | you already run Django and want to reuse its connection | you haven't read the transaction caveat above |
+| `InMemoryStore` | quick experiments, throwaway scripts | anything that has to survive a restart or a deploy — see below |
+
+**Durability matters more than it looks like it should.** An in-memory store
+forgets every key the moment the process exits. That's fine for a REPL
+session; it's a silent bug in production, because it means the *one*
+scenario idempotency exists for — a retry that arrives after a deploy or a
+crash — is exactly when the store has no memory of what already happened.
+If a key needs to survive process restarts, it needs to be in SQLite,
+Postgres, or Django's database — not in memory.
+
 ### Knowing whether *this* call did the work
 
 ```python
