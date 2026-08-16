@@ -37,7 +37,7 @@ import time
 from typing import Any
 
 from ..errors import StoreError
-from .base import Claim, Record, State
+from .base import Claim, Record, State, decode_response
 
 try:  # pragma: no cover - import guard
     from django.db import connections
@@ -49,13 +49,21 @@ except ImportError as exc:  # pragma: no cover
 
 TABLE = "justonce_keys"
 
+#: DDL per vendor.
+#:
+#: The Postgres shape must stay byte-for-byte compatible with
+#: `PostgresStore.SCHEMA` — same table name, same column types. Both DDLs are
+#: `CREATE TABLE IF NOT EXISTS`, so in a database where both stores are used the
+#: one that runs first wins and the other silently inherits its shape. When the
+#: two disagreed on `response` (`JSONB` here, `TEXT` there) the loser read back
+#: a JSON string where the contract promises the response object.
 _DDL = {
     "postgresql": f"""
 CREATE TABLE IF NOT EXISTS {TABLE} (
     key           TEXT PRIMARY KEY,
     state         TEXT NOT NULL,
     request_hash  TEXT NOT NULL,
-    response      TEXT,
+    response      JSONB,
     attempts      INTEGER NOT NULL DEFAULT 1,
     created_at    DOUBLE PRECISION NOT NULL,
     updated_at    DOUBLE PRECISION NOT NULL,
@@ -253,8 +261,17 @@ class DjangoStore:
 
     @property
     def _cols(self) -> str:
+        """Column list for reads.
+
+        Postgres gets an explicit `::text` on `response` for the same reason
+        `PostgresStore` does: the column may be `jsonb`, drivers disagree about
+        whether they decode it, and a recorded payload of `"done"` is
+        indistinguishable from JSON text once something has decoded it. Asking
+        for text makes the decode happen exactly once, here.
+        """
+        response = "response::text AS response" if self.vendor == "postgresql" else "response"
         return (
-            f"{self._key_col}, state, request_hash, response, attempts, "
+            f"{self._key_col}, state, request_hash, {response}, attempts, "
             "created_at, updated_at, expires_at"
         )
 
@@ -284,7 +301,7 @@ class DjangoStore:
             key=row[0],
             state=State(row[1]),
             request_hash=row[2],
-            response=json.loads(row[3]) if row[3] is not None else None,
+            response=decode_response(row[3]),
             attempts=row[4],
             created_at=row[5],
             updated_at=row[6],
