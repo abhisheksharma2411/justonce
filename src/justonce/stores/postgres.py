@@ -20,7 +20,7 @@ import time
 from typing import Any
 
 from ..errors import StoreError
-from .base import Claim, Record, State
+from .base import Claim, Record, State, decode_response
 
 try:  # pragma: no cover - import guard
     import psycopg
@@ -30,6 +30,9 @@ except ImportError as exc:  # pragma: no cover
         "PostgresStore requires psycopg. Install with: pip install justonce[postgres]"
     ) from exc
 
+#: Must stay identical to the Postgres DDL in `django_store` — same table, same
+#: column types. Both are `CREATE TABLE IF NOT EXISTS`, so whichever store runs
+#: first in a shared database decides the shape and the other inherits it.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS justonce_keys (
     key           TEXT        PRIMARY KEY,
@@ -44,6 +47,18 @@ CREATE TABLE IF NOT EXISTS justonce_keys (
 CREATE INDEX IF NOT EXISTS justonce_keys_state_updated
     ON justonce_keys (state, updated_at);
 """
+
+#: `response::text` is the point of this list, and the reason it exists instead
+#: of `SELECT *`. psycopg decodes a `jsonb` column for us, which sounds helpful
+#: until the recorded payload is itself a string: `"done"` comes back as
+#: `'done'`, indistinguishable from JSON text that still needs parsing. Asking
+#: Postgres for text means every row arrives encoded and is decoded exactly
+#: once — and it reads a table this store did not create, whatever type the
+#: `response` column happens to be.
+_COLUMNS = (
+    "key, state, request_hash, response::text AS response, "
+    "attempts, created_at, updated_at, expires_at"
+)
 
 
 class PostgresStore:
@@ -152,8 +167,8 @@ class PostgresStore:
         cutoff = older_than if older_than is not None else time.time()
         with self._connect() as conn:
             rows = conn.execute(
-                """
-                SELECT * FROM justonce_keys
+                f"""
+                SELECT {_COLUMNS} FROM justonce_keys
                  WHERE state = %s AND updated_at <= %s
                  ORDER BY updated_at ASC LIMIT %s
                 """,
@@ -178,7 +193,7 @@ class PostgresStore:
     @staticmethod
     def _get(conn: Any, key: str) -> Record | None:
         row = conn.execute(
-            "SELECT * FROM justonce_keys WHERE key = %s", (key,)
+            f"SELECT {_COLUMNS} FROM justonce_keys WHERE key = %s", (key,)
         ).fetchone()
         return PostgresStore._row(row) if row else None
 
@@ -188,7 +203,7 @@ class PostgresStore:
             key=row["key"],
             state=State(row["state"]),
             request_hash=row["request_hash"],
-            response=row["response"],
+            response=decode_response(row["response"]),
             attempts=row["attempts"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
