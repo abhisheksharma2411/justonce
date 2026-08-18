@@ -22,6 +22,7 @@ from justonce import (
     idempotent,
     operation_key,
 )
+from justonce.keys import fingerprint
 from justonce.stores import SqliteStore
 
 
@@ -209,8 +210,12 @@ def test_wait_policy_returns_the_winner_result() -> None:
 # 7. Retention --------------------------------------------------------------
 
 def test_sweep_removes_only_expired_terminal_records() -> None:
+    # `retention_seconds`, not `ttl_seconds`, is what makes a terminal record
+    # sweepable. This previously passed a short *claim* TTL and relied on the
+    # completed record inheriting it — which is the defect reported in #39, so
+    # the test was asserting the bug rather than the behaviour it names.
     store = SqliteStore(":memory:")
-    engine = Idempotent(store, ttl_seconds=0.01)
+    engine = Idempotent(store, ttl_seconds=60, retention_seconds=0.01)
     engine.run(operation_key("charge", "old"), lambda: "x", payload={})
     time.sleep(0.05)
     assert engine.sweep() == 1
@@ -266,3 +271,86 @@ def test_decorator_can_report_whether_it_executed() -> None:
 
     assert work(21).executed is True
     assert work(21).deduplicated is True
+
+
+# -- reported by an outside contributor (issues #39 and #40) -------------------
+#
+# Both reproducers below are the reporter's own, kept close to verbatim. Each
+# describes a way the library re-runs an effect it promised to run once, and
+# neither was caught by the tests above — worth keeping that visible.
+
+
+def test_completed_record_survives_the_claim_lease(tmp_path) -> None:
+    """#39: a completed record must be kept for `retention_seconds`.
+
+    A terminal record that keeps the *claim lease's* expiry is swept as soon as
+    the (deliberately short) claim TTL passes. The next delivery of the same
+    request then finds nothing and charges again.
+    """
+    store = SqliteStore(":memory:")
+    engine = Idempotent(store, ttl_seconds=0.01, retention_seconds=3600)
+    key = operation_key("charge", "order_1")
+
+    engine.run(key, lambda: {"charge_id": "ch_1"}, payload={"amount": 500})
+    time.sleep(0.03)  # outlive the claim lease, stay well inside retention
+
+    assert engine.sweep() == 0, "swept a completed record on its claim TTL"
+    record = store.lookup(key)
+    assert record is not None and record.response == {"charge_id": "ch_1"}
+
+
+def test_a_swept_key_is_the_duplicate_charge_it_looks_like() -> None:
+    """#39, stated as the consequence rather than the mechanism."""
+    store = SqliteStore(":memory:")
+    engine = Idempotent(store, ttl_seconds=0.01, retention_seconds=3600)
+    key = operation_key("charge", "order_1")
+    charges: list[int] = []
+
+    def charge() -> str:
+        charges.append(500)
+        return "ch_1"
+
+    engine.run(key, charge, payload={"amount": 500})
+    time.sleep(0.03)
+    engine.sweep()
+    engine.run(key, charge, payload={"amount": 500})
+
+    assert charges == [500], "the effect ran twice for one idempotency key"
+
+
+def test_expired_lease_does_not_let_a_different_payload_through() -> None:
+    """#40: reclaiming an expired lease must not bypass the divergence guard."""
+    store = SqliteStore(":memory:")
+    key = "charge:v1:order_1"
+    effects: list[str] = []
+
+    # A worker took a short lease for the original request, then died.
+    store.claim(key, fingerprint({"amount": 500}), 0.01)
+    time.sleep(0.03)
+
+    with pytest.raises(KeyReuseError):
+        Idempotent(store).run(
+            key,
+            lambda: effects.append("charged 9999") or "ok",
+            payload={"amount": 9999},
+        )
+
+    assert effects == [], "a different payload executed under an existing key"
+    record = store.lookup(key)
+    assert record is not None
+    assert record.request_hash == fingerprint({"amount": 500}), (
+        "the original fingerprint was overwritten, losing the evidence of divergence"
+    )
+
+
+def test_expired_lease_still_allows_the_same_payload_to_retry() -> None:
+    """The #40 guard must not break the case it shares a code path with."""
+    store = SqliteStore(":memory:")
+    key = "charge:v1:order_1"
+
+    store.claim(key, fingerprint({"amount": 500}), 0.01)
+    time.sleep(0.03)
+
+    result = Idempotent(store).run(key, lambda: "ch_1", payload={"amount": 500})
+    assert result.executed is True
+    assert result.value == "ch_1"

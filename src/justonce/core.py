@@ -127,11 +127,15 @@ class Idempotent:
             # The effect may or may not have applied. `retry_on_failure` says
             # which risk the caller prefers: a possible duplicate on retry, or
             # a possible lost effect. Never guess on their behalf.
-            self.store.fail(key, terminal=not retry_on_failure)
+            self.store.fail(
+                key,
+                terminal=not retry_on_failure,
+                retention_seconds=self.retention_seconds,
+            )
             raise
 
         try:
-            self.store.complete(key, value)
+            self.store.complete(key, value, retention_seconds=self.retention_seconds)
         except BaseException:
             # The effect DID happen; we just could not record it. Leave the key
             # unresolved rather than releasing it — releasing would let a retry

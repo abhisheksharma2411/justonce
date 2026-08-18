@@ -42,8 +42,12 @@ class AsyncStore(Protocol):
     """
 
     async def claim(self, key: str, request_hash: str, ttl_seconds: float) -> Claim: ...
-    async def complete(self, key: str, response: Any) -> None: ...
-    async def fail(self, key: str, *, terminal: bool) -> None: ...
+    async def complete(
+        self, key: str, response: Any, *, retention_seconds: float | None = None
+    ) -> None: ...
+    async def fail(
+        self, key: str, *, terminal: bool, retention_seconds: float | None = None
+    ) -> None: ...
     async def mark_unknown(self, key: str) -> None: ...
     async def lookup(self, key: str) -> Record | None: ...
     async def sweep(self, *, before: float) -> int: ...
@@ -73,11 +77,23 @@ class ThreadedStore:
     async def claim(self, key: str, request_hash: str, ttl_seconds: float) -> Claim:
         return await asyncio.to_thread(self._store.claim, key, request_hash, ttl_seconds)
 
-    async def complete(self, key: str, response: Any) -> None:
-        await asyncio.to_thread(self._store.complete, key, response)
+    async def complete(
+        self, key: str, response: Any, *, retention_seconds: float | None = None
+    ) -> None:
+        await asyncio.to_thread(
+            functools.partial(
+                self._store.complete, key, response, retention_seconds=retention_seconds
+            )
+        )
 
-    async def fail(self, key: str, *, terminal: bool) -> None:
-        await asyncio.to_thread(functools.partial(self._store.fail, key, terminal=terminal))
+    async def fail(
+        self, key: str, *, terminal: bool, retention_seconds: float | None = None
+    ) -> None:
+        await asyncio.to_thread(
+            functools.partial(
+                self._store.fail, key, terminal=terminal, retention_seconds=retention_seconds
+            )
+        )
 
     async def mark_unknown(self, key: str) -> None:
         await asyncio.to_thread(self._store.mark_unknown, key)
@@ -146,11 +162,15 @@ class AsyncIdempotent:
             # Includes asyncio.CancelledError: a cancelled effect may have
             # already applied, so the caller's retry_on_failure choice governs
             # here exactly as it does for any other failure.
-            await self.store.fail(key, terminal=not retry_on_failure)
+            await self.store.fail(
+                key,
+                terminal=not retry_on_failure,
+                retention_seconds=self.retention_seconds,
+            )
             raise
 
         try:
-            await self.store.complete(key, value)
+            await self.store.complete(key, value, retention_seconds=self.retention_seconds)
         except BaseException:
             # The effect DID happen and we could not record it. Leave the key
             # unresolved — releasing it would let a retry apply the effect twice.

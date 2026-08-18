@@ -145,21 +145,77 @@ class StoreConformanceTests:
         store.claim("k", "h", 3600)
         assert store.claim("k", "h", 3600).lost, "stole a claim that had not expired"
 
-    # -- retention ----------------------------------------------------------
+    def test_expired_claim_is_not_reclaimable_by_a_different_request(self) -> None:
+        """An expired lease means the holder died, not that the key is free.
 
-    def test_sweep_removes_expired_terminal_records(self) -> None:
+        Reclaiming with a different fingerprint would let one idempotency key
+        execute two different requests — the failure the key exists to prevent.
+        """
         store = self.make_store()
-        store.claim("k", "h", ttl_seconds=-1)
-        store.complete("k", "done")
+        store.claim("k", "original", ttl_seconds=-1)
+
+        claim = store.claim("k", "different", TTL)
+
+        assert claim.lost, "a different request reclaimed an expired lease"
+        record = _found(claim.record)
+        assert record.request_hash == "original", (
+            "reclaim overwrote the stored fingerprint, so the caller above "
+            "cannot tell that the request diverged"
+        )
+
+    def test_expired_claim_is_reclaimable_by_the_same_request(self) -> None:
+        """The guard above must not block an honest retry of the same request."""
+        store = self.make_store()
+        store.claim("k", "same", ttl_seconds=-1)
+        assert store.claim("k", "same", TTL).won is True
+
+    # -- retention ----------------------------------------------------------
+    #
+    # Retention is not the claim lease. `expires_at` carries the lease deadline
+    # while a record is IN_PROGRESS and the retention deadline once it is
+    # terminal, so a store that leaves it alone on completion sweeps successful
+    # records one claim-TTL after they are written. That deletes the evidence a
+    # later delivery needs, and the effect runs a second time.
+
+    def test_sweep_removes_terminal_records_past_their_retention(self) -> None:
+        store = self.make_store()
+        store.claim("k", "h", TTL)
+        store.complete("k", "done", retention_seconds=-1)
         assert store.sweep(before=time.time()) == 1
         assert store.lookup("k") is None
 
-    def test_sweep_keeps_unexpired_terminal_records(self) -> None:
+    def test_sweep_keeps_terminal_records_inside_their_retention(self) -> None:
         store = self.make_store()
-        store.claim("k", "h", 3600)
-        store.complete("k", "done")
+        store.claim("k", "h", TTL)
+        store.complete("k", "done", retention_seconds=3600)
         assert store.sweep(before=time.time()) == 0
         assert store.lookup("k") is not None
+
+    def test_retention_outlives_a_short_claim_lease(self) -> None:
+        """The regression: a long retention must survive a short claim TTL."""
+        store = self.make_store()
+        store.claim("k", "h", ttl_seconds=-1)  # lease already expired
+        store.complete("k", "done", retention_seconds=3600)
+
+        assert store.sweep(before=time.time()) == 0, (
+            "swept a completed record on its claim lease instead of its retention"
+        )
+        assert _found(store.lookup("k")).response == "done"
+
+    def test_terminal_record_without_retention_is_never_swept(self) -> None:
+        """No retention means keep it. Losing a record costs more than storage."""
+        store = self.make_store()
+        store.claim("k", "h", ttl_seconds=-1)
+        store.complete("k", "done")
+        assert store.sweep(before=time.time() + 10_000) == 0
+        assert store.lookup("k") is not None
+
+    def test_terminal_failure_honours_retention_too(self) -> None:
+        store = self.make_store()
+        store.claim("k", "h", ttl_seconds=-1)
+        store.fail("k", terminal=True, retention_seconds=3600)
+        assert store.sweep(before=time.time()) == 0
+        assert _found(store.lookup("k")).state is State.FAILED
 
     # -- misc ---------------------------------------------------------------
 
