@@ -14,8 +14,29 @@ this contract, and a store that passes it is correct by our definition.
 from __future__ import annotations
 
 import enum
+import json
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
+
+
+def decode_response(value: Any) -> Any:
+    """Parse a stored response back into the object that was recorded.
+
+    Callers must hand this JSON *text* — never a value a driver has already
+    decoded. That distinction cannot be recovered by inspection: a recorded
+    payload of `"done"` arrives as the string `'done'` once decoded and as the
+    string `'"done"'` while still encoded, and only the second is parseable. So
+    the stores select the column as text explicitly rather than letting each
+    driver decide, and this function does one unconditional decode.
+
+    Bytes are accepted because some drivers hand back a buffer for text
+    columns.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        value = bytes(value).decode("utf-8")
+    return json.loads(value)
 
 
 class State(str, enum.Enum):

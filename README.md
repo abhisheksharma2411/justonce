@@ -197,6 +197,19 @@ Temporal, Restate, DBOS and friends solve a broader problem, and solve it well â
 
 Use justonce when you want *one dangerous call* made safe this afternoon. Use a workflow engine when you need orchestration, timers, and long-running state.
 
+## FastAPI payment example
+
+The copyable [`examples/fastapi_payment.py`](examples/fastapi_payment.py) endpoint accepts an
+`Idempotency-Key`, uses a credential-free payment provider, and returns the recorded response on
+replay. Run it from the repository root:
+
+```bash
+uv run --extra examples uvicorn examples.fastapi_payment:app --reload
+```
+
+Open `http://127.0.0.1:8000/docs` to try the successful, replay, key-reuse (422), and concurrent
+in-flight (409) paths.
+
 ## Contributing
 
 The core is small on purpose. Most of the value is at the edges, and that's where help is most useful:
