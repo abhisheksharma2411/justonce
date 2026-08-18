@@ -195,14 +195,18 @@ class DjangoStore:
                 # Lost the insert. Reclaim only if the holder's lease expired,
                 # and only through a conditional UPDATE so two reclaimers cannot
                 # both succeed.
+                #
+                # `request_hash = %s` is the divergence guard, not an
+                # optimisation. Without it this UPDATE overwrites the stored
+                # hash and a *different* payload inherits the key and executes.
                 cur.execute(
                     f"UPDATE {TABLE} SET state = %s, request_hash = %s, updated_at = %s, "
                     "expires_at = %s, attempts = attempts + 1, response = NULL "
-                    f"WHERE {self._key_col} = %s AND state = %s "
+                    f"WHERE {self._key_col} = %s AND state = %s AND request_hash = %s "
                     "AND expires_at IS NOT NULL AND expires_at < %s",
                     [
                         State.IN_PROGRESS.value, request_hash, now, expires,
-                        key, State.IN_PROGRESS.value, now,
+                        key, State.IN_PROGRESS.value, request_hash, now,
                     ],
                 )
                 if cur.rowcount == 1:
@@ -211,12 +215,12 @@ class DjangoStore:
         except Exception as exc:
             raise StoreError(f"django claim failed for {key!r}: {exc}") from exc
 
-    def complete(self, key: str, response: Any) -> None:
-        self._terminal(key, State.SUCCEEDED, response)
+    def complete(self, key: str, response: Any, *, retention_seconds: float | None = None) -> None:
+        self._terminal(key, State.SUCCEEDED, response, retention_seconds)
 
-    def fail(self, key: str, *, terminal: bool) -> None:
+    def fail(self, key: str, *, terminal: bool, retention_seconds: float | None = None) -> None:
         if terminal:
-            self._terminal(key, State.FAILED, None)
+            self._terminal(key, State.FAILED, None, retention_seconds)
             return
         with self._conn.cursor() as cur:
             cur.execute(f"DELETE FROM {TABLE} WHERE {self._key_col} = %s", [key])
@@ -275,15 +279,23 @@ class DjangoStore:
             "created_at, updated_at, expires_at"
         )
 
-    def _terminal(self, key: str, state: State, response: Any) -> None:
+    def _terminal(
+        self, key: str, state: State, response: Any, retention_seconds: float | None = None
+    ) -> None:
+        # `expires_at` is replaced, never left alone — see the note in the
+        # SQLite store. A terminal record still holding its claim lease gets
+        # swept one claim-TTL after it was written, whatever retention says.
+        now = time.time()
+        expires = None if retention_seconds is None else now + retention_seconds
         with self._conn.cursor() as cur:
             cur.execute(
-                f"UPDATE {TABLE} SET state = %s, response = %s, updated_at = %s "
+                f"UPDATE {TABLE} SET state = %s, response = %s, updated_at = %s, expires_at = %s "
                 f"WHERE {self._key_col} = %s",
                 [
                     state.value,
                     json.dumps(response) if response is not None else None,
-                    time.time(),
+                    now,
+                    expires,
                     key,
                 ],
             )

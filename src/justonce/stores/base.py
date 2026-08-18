@@ -106,21 +106,41 @@ class Store(Protocol):
         A claim whose `expires_at` has passed is reclaimable: the previous
         holder is presumed dead, and reclaiming must also be atomic.
 
+        **Reclaiming must require a matching `request_hash`.** An expired lease
+        says the previous holder died, not that the key is free for a different
+        request. A reclaim that overwrites the stored hash silently defeats the
+        divergence guard: the same key would go on to execute a different
+        payload. A caller whose hash differs must lose the claim and find the
+        original hash still on the record, so the layer above can raise.
+
         Must NOT raise on losing a claim — losing is an expected outcome, not an
         error. Raise `StoreError` only when the store itself failed.
         """
         ...
 
-    def complete(self, key: str, response: Any) -> None:
-        """Record a successful outcome and its response."""
+    def complete(self, key: str, response: Any, *, retention_seconds: float | None = None) -> None:
+        """Record a successful outcome and its response.
+
+        `retention_seconds` sets how long the record stays sweepable-from —
+        `sweep` may delete it once that window passes. Passing `None` means
+        keep it indefinitely.
+
+        This is the parameter that makes a completed record outlive the claim
+        lease. A terminal record left holding its lease expiry gets swept as
+        soon as the (short) claim TTL passes, and the next delivery of the same
+        request finds nothing and runs the effect again.
+        """
         ...
 
-    def fail(self, key: str, *, terminal: bool) -> None:
+    def fail(self, key: str, *, terminal: bool, retention_seconds: float | None = None) -> None:
         """Record a failed outcome.
 
         `terminal=True` means do not retry this key — the effect definitively
         did not happen. `terminal=False` releases the claim so a later attempt
         can retry, which is correct for transient failures.
+
+        `retention_seconds` applies to terminal failures only, and means what it
+        means in `complete`. It is ignored when the claim is released.
         """
         ...
 

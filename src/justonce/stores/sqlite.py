@@ -74,6 +74,13 @@ class SqliteStore:
                 # Lost the insert. The holder may be dead — reclaim only if its
                 # lease expired, and only via a conditional UPDATE so two
                 # reclaimers cannot both succeed.
+                #
+                # `request_hash = ?` in the WHERE clause is the divergence
+                # guard, not an optimisation. Without it the UPDATE overwrites
+                # the stored hash, and a *different* payload inherits the key
+                # and executes — the exact thing an idempotency key exists to
+                # prevent. A caller whose hash differs must lose here and meet
+                # the original hash in `_resolve_loser`.
                 cur = self._conn.execute(
                     """
                     UPDATE justonce_keys
@@ -81,12 +88,13 @@ class SqliteStore:
                            expires_at = ?, attempts = attempts + 1, response = NULL
                      WHERE key = ?
                        AND state = ?
+                       AND request_hash = ?
                        AND expires_at IS NOT NULL
                        AND expires_at < ?
                     """,
                     (
                         State.IN_PROGRESS.value, request_hash, now, expires,
-                        key, State.IN_PROGRESS.value, now,
+                        key, State.IN_PROGRESS.value, request_hash, now,
                     ),
                 )
                 if cur.rowcount == 1:
@@ -95,12 +103,12 @@ class SqliteStore:
             except sqlite3.Error as exc:  # pragma: no cover - defensive
                 raise StoreError(f"sqlite claim failed for {key!r}: {exc}") from exc
 
-    def complete(self, key: str, response: Any) -> None:
-        self._set_terminal(key, State.SUCCEEDED, response)
+    def complete(self, key: str, response: Any, *, retention_seconds: float | None = None) -> None:
+        self._set_terminal(key, State.SUCCEEDED, response, retention_seconds)
 
-    def fail(self, key: str, *, terminal: bool) -> None:
+    def fail(self, key: str, *, terminal: bool, retention_seconds: float | None = None) -> None:
         if terminal:
-            self._set_terminal(key, State.FAILED, None)
+            self._set_terminal(key, State.FAILED, None, retention_seconds)
             return
         # Transient: drop the claim so a later attempt can retry cleanly.
         with self._lock:
@@ -152,16 +160,24 @@ class SqliteStore:
 
     # -- internals ----------------------------------------------------------
 
-    def _set_terminal(self, key: str, state: State, response: Any) -> None:
+    def _set_terminal(
+        self, key: str, state: State, response: Any, retention_seconds: float | None = None
+    ) -> None:
+        # `expires_at` is replaced, never left alone. Until it is, the row still
+        # carries the *claim lease's* deadline, and `sweep` reads that column
+        # for terminal records too — so a completed record would be deleted one
+        # claim-TTL after it was written, however long retention was set to.
+        now = time.time()
+        expires = None if retention_seconds is None else now + retention_seconds
         with self._lock:
             self._conn.execute(
                 """
                 UPDATE justonce_keys
-                   SET state = ?, response = ?, updated_at = ?
+                   SET state = ?, response = ?, updated_at = ?, expires_at = ?
                  WHERE key = ?
                 """,
                 (state.value, json.dumps(response) if response is not None else None,
-                 time.time(), key),
+                 now, expires, key),
             )
 
     def _get(self, key: str) -> Record | None:

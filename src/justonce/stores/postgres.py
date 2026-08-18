@@ -103,6 +103,11 @@ class PostgresStore:
                 if row is not None:
                     return Claim(won=True, record=self._get(conn, key))
 
+                # `request_hash = %s` here is the divergence guard, not an
+                # optimisation. Without it this UPDATE overwrites the stored
+                # hash and a *different* payload inherits the key and executes.
+                # A caller whose hash differs must lose and meet the original
+                # hash on the record.
                 row = conn.execute(
                     """
                     UPDATE justonce_keys
@@ -110,13 +115,14 @@ class PostgresStore:
                            expires_at = %s, attempts = attempts + 1, response = NULL
                      WHERE key = %s
                        AND state = %s
+                       AND request_hash = %s
                        AND expires_at IS NOT NULL
                        AND expires_at < %s
                     RETURNING key
                     """,
                     (
                         State.IN_PROGRESS.value, request_hash, now, expires,
-                        key, State.IN_PROGRESS.value, now,
+                        key, State.IN_PROGRESS.value, request_hash, now,
                     ),
                 ).fetchone()
                 if row is not None:
@@ -125,12 +131,12 @@ class PostgresStore:
         except psycopg.Error as exc:
             raise StoreError(f"postgres claim failed for {key!r}: {exc}") from exc
 
-    def complete(self, key: str, response: Any) -> None:
-        self._terminal(key, State.SUCCEEDED, response)
+    def complete(self, key: str, response: Any, *, retention_seconds: float | None = None) -> None:
+        self._terminal(key, State.SUCCEEDED, response, retention_seconds)
 
-    def fail(self, key: str, *, terminal: bool) -> None:
+    def fail(self, key: str, *, terminal: bool, retention_seconds: float | None = None) -> None:
         if terminal:
-            self._terminal(key, State.FAILED, None)
+            self._terminal(key, State.FAILED, None, retention_seconds)
             return
         with self._connect() as conn:
             conn.execute("DELETE FROM justonce_keys WHERE key = %s", (key,))
@@ -178,16 +184,23 @@ class PostgresStore:
 
     # -- internals ----------------------------------------------------------
 
-    def _terminal(self, key: str, state: State, response: Any) -> None:
+    def _terminal(
+        self, key: str, state: State, response: Any, retention_seconds: float | None = None
+    ) -> None:
+        # `expires_at` is replaced, never left alone — see the note in the
+        # SQLite store. A terminal record still holding its claim lease gets
+        # swept one claim-TTL after it was written, whatever retention says.
+        now = time.time()
+        expires = None if retention_seconds is None else now + retention_seconds
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE justonce_keys
-                   SET state = %s, response = %s, updated_at = %s
+                   SET state = %s, response = %s, updated_at = %s, expires_at = %s
                  WHERE key = %s
                 """,
                 (state.value, json.dumps(response) if response is not None else None,
-                 time.time(), key),
+                 now, expires, key),
             )
 
     @staticmethod
