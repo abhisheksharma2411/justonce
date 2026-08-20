@@ -77,18 +77,20 @@ mode you are actually in.
 
 | Store | Use when | Not when |
 |---|---|---|
-| `SqliteStore` | single host — local dev, tests, a single-instance deployment | you're running more than one machine or worker process |
+| `SqliteStore("path.db")` | single host — local dev, tests, a single-instance deployment | you're running more than one machine or worker process |
 | `PostgresStore` | a fleet of workers sharing state, no existing Django app | — |
 | `DjangoStore` | you already run Django and want to reuse its connection | you haven't read the transaction caveat above |
-| `InMemoryStore` | quick experiments, throwaway scripts | anything that has to survive a restart or a deploy — see below |
 
-**Durability matters more than it looks like it should.** An in-memory store
-forgets every key the moment the process exits. That's fine for a REPL
-session; it's a silent bug in production, because it means the *one*
-scenario idempotency exists for — a retry that arrives after a deploy or a
-crash — is exactly when the store has no memory of what already happened.
-If a key needs to survive process restarts, it needs to be in SQLite,
-Postgres, or Django's database — not in memory.
+**Durability matters more than it looks like it should, and the default is
+not durable.** `SqliteStore()` defaults to `path=":memory:"`, so a store
+constructed with no arguments forgets every key the moment the process
+exits. That's fine for a REPL session or a test; it's a silent bug in
+production, because it means the *one* scenario idempotency exists for — a
+retry that arrives after a deploy or a crash — is exactly when the store
+has no memory of what already happened.
+
+If a key needs to survive process restarts, pass a real path
+(`SqliteStore("justonce.db")`) or use `PostgresStore` or `DjangoStore`.
 
 ### Knowing whether *this* call did the work
 
