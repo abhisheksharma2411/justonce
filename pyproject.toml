@@ -1,6 +1,6 @@
 [project]
 name = "justonce"
-version = "0.1.0"
+version = "0.2.0"
 description = "Make side effects happen exactly once. Idempotency keys, atomic claims, and an effect ledger for code that charges money, sends messages, or mutates state."
 readme = "README.md"
 requires-python = ">=3.9"

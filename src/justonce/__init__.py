@@ -39,7 +39,7 @@ from .errors import (
 from .keys import fingerprint, operation_key
 from .stores.base import Claim, Record, State, Store
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "DEFAULT_RETENTION_SECONDS",
