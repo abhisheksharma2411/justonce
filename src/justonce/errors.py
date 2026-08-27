@@ -58,6 +58,32 @@ class InFlightTimeout(OperationInFlightError):
         self.waited_seconds = waited_seconds
 
 
+class KeyTooLongError(JustOnceError):
+    """The key is longer than the backing column can store whole.
+
+    Raised instead of letting the store truncate. Truncation is the dangerous
+    outcome, not the error: two distinct keys sharing a long prefix collapse
+    onto one, so a second, genuinely different intent is deduplicated away and
+    **its effect never runs**. A silently skipped payout is worse than a
+    duplicate one, because nothing alerts on it.
+
+    Map this to HTTP 400 at an API boundary — the key is the caller's to fix.
+    """
+
+    def __init__(self, key: str, limit: int, backend: str) -> None:
+        super().__init__(
+            f"idempotency key is {len(key)} characters and {backend} stores "
+            f"{limit}; refusing to truncate it. Two keys sharing a "
+            f"{limit}-character prefix would collapse onto one and the second "
+            f"intent would never run. Either shorten the key, or widen the "
+            f"column and tell the store its new size with "
+            f"max_key_length=. Key begins {key[:48]!r}"
+        )
+        self.key = key
+        self.limit = limit
+        self.backend = backend
+
+
 class StoreError(JustOnceError):
     """The backing store could not be reached or returned something unusable.
 

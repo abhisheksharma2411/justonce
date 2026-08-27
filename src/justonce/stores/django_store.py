@@ -34,10 +34,10 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import Any, Literal
 
 from ..errors import StoreError
-from .base import Claim, Record, State, decode_response
+from .base import Claim, Record, State, check_key_length, decode_response
 
 try:  # pragma: no cover - import guard
     from django.db import connections
@@ -48,6 +48,26 @@ except ImportError as exc:  # pragma: no cover
     ) from exc
 
 TABLE = "justonce_keys"
+
+#: Width of the MySQL `key` column in the DDL below, and therefore the longest
+#: key this store will accept on MySQL.
+#:
+#: MySQL is the only bundled backend with a *declared* key width; Postgres and
+#: SQLite use unbounded `TEXT`. The number is not arbitrary — a `VARCHAR` index
+#: is limited to 3072 bytes on InnoDB's DYNAMIC row format, and utf8mb4 costs
+#: four bytes per character, so 768 is the widest a `VARCHAR` primary key can
+#: be. Staying at 255 keeps the DDL working on the older COMPACT row format,
+#: whose limit is 767 bytes.
+#:
+#: If 255 is too tight, widen the column and tell the store::
+#:
+#:     ALTER TABLE justonce_keys MODIFY `key` VARCHAR(768) NOT NULL;
+#:     DjangoStore(max_key_length=768)
+#:
+#: The store cannot infer this: the DDL is `CREATE TABLE IF NOT EXISTS`, so an
+#: existing table keeps whatever width it was created with, and guessing wide
+#: would reintroduce exactly the silent truncation this guards against.
+MYSQL_KEY_LENGTH = 255
 
 #: DDL per vendor.
 #:
@@ -123,12 +143,36 @@ class DjangoStore:
             commits independently of a rollback.
         create_table: issue the DDL on construction. Convenient in development;
             prefer a real migration in production.
+        max_key_length: longest key the `key` column holds whole. Leave
+            `"auto"` to follow the shipped DDL — `MYSQL_KEY_LENGTH` on MySQL,
+            unbounded elsewhere. Pass an int if you widened the column, or
+            `None` to disable the check entirely, which re-exposes you to
+            silent truncation.
     """
 
-    def __init__(self, using: str | None = None, *, create_table: bool = False) -> None:
+    def __init__(
+        self,
+        using: str | None = None,
+        *,
+        create_table: bool = False,
+        max_key_length: int | Literal["auto"] | None = "auto",
+    ) -> None:
         self.using = using or "default"
+        self._max_key_length = max_key_length
         if create_table:
             self.create_table()
+
+    @property
+    def max_key_length(self) -> int | None:
+        """Longest key this backend stores whole; `None` when unbounded.
+
+        `"auto"` reports `MYSQL_KEY_LENGTH` on MySQL and `None` elsewhere,
+        matching the DDL this store ships. Pass an explicit value after
+        widening the column yourself.
+        """
+        if isinstance(self._max_key_length, str):
+            return MYSQL_KEY_LENGTH if self.vendor == "mysql" else None
+        return self._max_key_length
 
     # -- helpers ------------------------------------------------------------
 
@@ -181,6 +225,9 @@ class DjangoStore:
     # -- contract -----------------------------------------------------------
 
     def claim(self, key: str, request_hash: str, ttl_seconds: float) -> Claim:
+        # Before the try: a key this store cannot hold is the caller's bug, not
+        # a store failure, and must not be reported as `StoreError`.
+        check_key_length(key, self.max_key_length, self.vendor)
         now = time.time()
         expires = now + ttl_seconds
         try:

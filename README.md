@@ -151,6 +151,34 @@ request.headers["Idempotency-Key"]         # ✓ client-supplied, reused on retr
 
 The key comes from the **initiating event or the client** — never from the layer doing the retrying.
 
+### Key length
+
+`SqliteStore` and `PostgresStore` store keys in unbounded `TEXT`, so length is not a concern. **MySQL is the exception**: the shipped DDL declares `key VARCHAR(255)`, and namespaced keys get long faster than you'd expect — `operation_key("charge", tenant_id, order_id, attempt_id)` with UUIDs is already past 140 characters.
+
+Over-length keys are refused rather than stored, because the alternative is worse than an error:
+
+```python
+KeyTooLongError: idempotency key is 300 characters and mysql stores 255;
+refusing to truncate it. Two keys sharing a 255-character prefix would
+collapse onto one and the second intent would never run.
+```
+
+A truncated key is a *collided* key. The second intent is treated as a replay of the first, so its effect is **never applied** — a silently skipped payout, which nothing alerts on, unlike a duplicate one. Whether MySQL truncates or errors on its own depends on `sql_mode`, and a correctness guarantee cannot rest on a session variable.
+
+If 255 is too tight, widen the column and tell the store:
+
+```sql
+ALTER TABLE justonce_keys MODIFY `key` VARCHAR(768) NOT NULL;
+```
+
+```python
+DjangoStore(max_key_length=768)
+```
+
+768 is the widest a `VARCHAR` primary key can be under utf8mb4 — InnoDB caps index keys at 3072 bytes and utf8mb4 costs four bytes per character. The store can't detect the width for you: the DDL is `CREATE TABLE IF NOT EXISTS`, so an existing table keeps whatever it was created with, and guessing wide would reintroduce the truncation this prevents.
+
+Writing your own store? Declare `max_key_length` if your key column has a fixed width, and leave it unset if it doesn't. [`justonce.conformance`](src/justonce/conformance.py) checks both cases.
+
 ## What it guarantees
 
 | Situation | Behaviour |

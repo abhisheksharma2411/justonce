@@ -18,6 +18,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from ..errors import KeyTooLongError
+
 
 def decode_response(value: Any) -> Any:
     """Parse a stored response back into the object that was recorded.
@@ -37,6 +39,22 @@ def decode_response(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         value = bytes(value).decode("utf-8")
     return json.loads(value)
+
+
+def check_key_length(key: str, limit: int | None, backend: str) -> None:
+    """Refuse a key the backend cannot store whole. `None` means unbounded.
+
+    Every store calls this before claiming. The point is to convert a silent
+    data-corruption into a loud error at the boundary: a truncated key is a
+    *collided* key, and a collision here means the second intent is treated as
+    a replay of the first and its effect is never applied.
+
+    Which way a backend fails without this is a configuration detail rather
+    than a design one — MySQL truncates or errors depending on `sql_mode` — and
+    a correctness guarantee cannot rest on a session variable.
+    """
+    if limit is not None and len(key) > limit:
+        raise KeyTooLongError(key, limit, backend)
 
 
 class State(str, enum.Enum):
@@ -91,7 +109,15 @@ class Claim:
 
 @runtime_checkable
 class Store(Protocol):
-    """Persistence contract for claims and their outcomes."""
+    """Persistence contract for claims and their outcomes.
+
+    Stores may also expose ``max_key_length: int | None`` — the longest key the
+    backing column holds whole, or `None` for unbounded. It is read with
+    `getattr`, so it is optional and existing stores keep working; declaring it
+    is how a store with a fixed-width key column earns the guard in
+    `check_key_length`. A store that leaves it unset is asserting its key
+    column cannot truncate.
+    """
 
     def claim(self, key: str, request_hash: str, ttl_seconds: float) -> Claim:
         """Atomically claim `key`, or report that someone else holds it.

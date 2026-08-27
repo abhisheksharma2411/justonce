@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import StoreError
-from .base import Claim, Record, State, decode_response
+from .base import Claim, Record, State, check_key_length, decode_response
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS justonce_keys (
@@ -39,6 +39,9 @@ CREATE INDEX IF NOT EXISTS justonce_keys_state_updated
 class SqliteStore:
     """SQLite-backed store. Pass ``":memory:"`` for an ephemeral store."""
 
+    #: SQLite's `TEXT` has no declared width, so no key is ever truncated.
+    max_key_length: int | None = None
+
     def __init__(self, path: str | Path = ":memory:", *, timeout: float = 5.0) -> None:
         self._path = str(path)
         self._lock = threading.Lock()
@@ -55,6 +58,7 @@ class SqliteStore:
     # -- contract -----------------------------------------------------------
 
     def claim(self, key: str, request_hash: str, ttl_seconds: float) -> Claim:
+        check_key_length(key, self.max_key_length, "sqlite")
         now = time.time()
         expires = now + ttl_seconds
         with self._lock:

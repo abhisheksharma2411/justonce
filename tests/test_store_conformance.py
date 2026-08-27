@@ -10,6 +10,7 @@ import os
 
 import pytest
 
+from justonce import KeyTooLongError
 from justonce.conformance import StoreConformanceTests
 from justonce.stores import SqliteStore
 
@@ -177,3 +178,68 @@ class TestPostgresAndDjangoStoresShareOneTable:
         for store in (django_store, postgres_store):
             assert store.lookup("via-django").response == {"charge_id": "ch_1"}  # type: ignore[union-attr]
             assert store.lookup("via-psycopg").response == {"charge_id": "ch_2"}  # type: ignore[union-attr]
+
+
+class TestStoreWithAFixedWidthKeyColumn(StoreConformanceTests):
+    """The whole contract, against a store that declares a key width.
+
+    MySQL is the bundled backend with a fixed-width `key` column, and it has no
+    service in CI. Declaring a width on SQLite exercises the same code path —
+    the guard, and the width-aware conformance tests — everywhere the suite
+    runs, rather than only where a MySQL server happens to exist.
+    """
+
+    LIMIT = 255
+
+    def make_store(self) -> SqliteStore:
+        class Narrow(SqliteStore):
+            max_key_length = TestStoreWithAFixedWidthKeyColumn.LIMIT
+
+        return Narrow(":memory:")
+
+    def test_the_guard_actually_fires(self) -> None:
+        store = self.make_store()
+        with pytest.raises(KeyTooLongError) as caught:
+            store.claim("x" * (self.LIMIT + 1), "hash", 60)
+
+        # The message has to be actionable: someone reads it at 3am with a
+        # payout stuck behind it.
+        assert caught.value.limit == self.LIMIT
+        assert "max_key_length" in str(caught.value)
+
+
+def test_conformance_catches_a_store_that_truncates() -> None:
+    """The contract must fail a store with the defect it was written for.
+
+    A width test that passes against a truncating store proves nothing. This
+    store is MySQL in non-strict `sql_mode`: it silently keeps the first 255
+    characters of every key and declares no limit, so two distinct intents
+    collapse onto one and the second effect is never applied.
+    """
+
+    class Truncating(SqliteStore):
+        max_key_length = None  # claims to be unbounded, and is not
+
+        def claim(self, key, request_hash, ttl_seconds):  # type: ignore[no-untyped-def]
+            return super().claim(key[:255], request_hash, ttl_seconds)
+
+        def lookup(self, key):  # type: ignore[no-untyped-def]
+            return super().lookup(key[:255])
+
+    class Contract(StoreConformanceTests):
+        def make_store(self) -> SqliteStore:
+            return Truncating(":memory:")
+
+    contract = Contract()
+
+    with pytest.raises(AssertionError, match=r"two intents as one|never run"):
+        contract.test_distinct_long_keys_do_not_collide()
+
+    with pytest.raises(AssertionError, match=r"altered the key"):
+        contract.test_a_long_key_survives_intact()
+
+    # And the same store passes everything that does not concern key width, so
+    # the two new tests are what caught it — not incidental breakage.
+    contract.test_only_one_concurrent_claimer_wins()
+    contract.test_loser_can_read_the_recorded_response()
+    contract.test_unknown_is_never_swept()
