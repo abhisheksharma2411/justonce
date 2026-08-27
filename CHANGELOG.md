@@ -5,6 +5,22 @@ All notable changes to `justonce` are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed (internal)
+
+- **The sync and async engines now share one state machine.** They previously
+  implemented the same decision logic twice and agreed only because they were
+  written together; a fix applied to one and forgotten in the other would have
+  given async callers weaker guarantees than documented, silently. The decision
+  is now a pure function in `justonce.machine`, which both engines call, and a
+  parity suite runs ten scenarios through both and compares the outcomes to each
+  other as well as to the expected answer. No behaviour change ([#51], [#60]).
+
+  `OnInFlight` and `Result` moved to `justonce.machine` and are re-exported from
+  `justonce.core`; imports from either module, and from `justonce`, are
+  unaffected.
+
 ## [0.2.0] — 2026-08-21
 
 ### Fixed
@@ -69,5 +85,8 @@ conformance suite.
 [#57]: https://github.com/abhisheksharma2411/justonce/pull/57
 [#58]: https://github.com/abhisheksharma2411/justonce/pull/58
 [#59]: https://github.com/abhisheksharma2411/justonce/pull/59
+[#51]: https://github.com/abhisheksharma2411/justonce/issues/51
+[#60]: https://github.com/abhisheksharma2411/justonce/pull/60
+[Unreleased]: https://github.com/abhisheksharma2411/justonce/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/abhisheksharma2411/justonce/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/abhisheksharma2411/justonce/releases/tag/v0.1.0

@@ -16,14 +16,13 @@ was charged" is a fact worth keeping.
 
 from __future__ import annotations
 
-import enum
 import time
-from dataclasses import dataclass
 from typing import Any, Callable, TypeVar
 
-from .errors import InFlightTimeout, KeyReuseError, OperationInFlightError
+from .errors import InFlightTimeout
 from .keys import fingerprint
-from .stores.base import Record, State, Store
+from .machine import OnInFlight, Result, settle
+from .stores.base import Record, Store
 
 T = TypeVar("T")
 
@@ -39,28 +38,16 @@ DEFAULT_TTL_SECONDS = 15 * 60
 DEFAULT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
 
-class OnInFlight(str, enum.Enum):
-    """What to do when another caller holds the claim."""
-
-    RAISE = "raise"
-    """Reject immediately. Simplest and safest; maps to HTTP 409."""
-
-    WAIT = "wait"
-    """Poll until the holder reaches a terminal state, bounded by `wait_timeout`."""
-
-
-@dataclass(frozen=True)
-class Result:
-    """Outcome of an idempotent execution."""
-
-    value: Any
-    executed: bool
-    """True if this call ran the effect; False if a previous one did."""
-    record: Record | None = None
-
-    @property
-    def deduplicated(self) -> bool:
-        return not self.executed
+# `OnInFlight` and `Result` are re-exported here so existing imports keep
+# working. Both now live in `justonce.machine`, alongside the decision logic the
+# async engine shares with this one.
+__all__ = [
+    "DEFAULT_RETENTION_SECONDS",
+    "DEFAULT_TTL_SECONDS",
+    "Idempotent",
+    "OnInFlight",
+    "Result",
+]
 
 
 class Idempotent:
@@ -157,43 +144,19 @@ class Idempotent:
     # -- internals ----------------------------------------------------------
 
     def _resolve_loser(self, key: str, request_hash: str, record: Record | None) -> Result:
-        if record is None:
-            # The holder finished and its record was swept between our failed
-            # claim and this read. Treat as in-flight: the safe answer when we
-            # cannot prove the effect did not run is to refuse, not to run it.
-            raise OperationInFlightError(key)
-
-        if record.request_hash != request_hash:
-            raise KeyReuseError(key)
-
-        if record.state is State.SUCCEEDED:
-            return Result(value=record.response, executed=False, record=record)
-        if record.state is State.FAILED:
-            return Result(value=None, executed=False, record=record)
-        if record.state is State.UNKNOWN:
-            # Outcome genuinely unknown. Running again risks a duplicate; the
-            # caller must resolve it through reconciliation, not by retrying.
-            raise OperationInFlightError(key)
-
-        if self.on_in_flight is OnInFlight.RAISE:
-            raise OperationInFlightError(key)
+        settled = settle(key, record, request_hash, self.on_in_flight)
+        if settled is not None:
+            return settled
         return self._wait_for(key, request_hash)
 
     def _wait_for(self, key: str, request_hash: str) -> Result:
         deadline = time.monotonic() + self.wait_timeout
         while time.monotonic() < deadline:
             time.sleep(self.poll_interval)
-            record = self.store.lookup(key)
-            if record is None:
-                raise OperationInFlightError(key)
-            if record.request_hash != request_hash:
-                raise KeyReuseError(key)
-            if record.is_terminal:
-                return Result(
-                    value=record.response if record.state is State.SUCCEEDED else None,
-                    executed=False,
-                    record=record,
-                )
-            if record.state is State.UNKNOWN:
-                raise OperationInFlightError(key)
+            # OnInFlight.WAIT, not self.on_in_flight: reaching here already
+            # means waiting was chosen, and a still-in-progress holder must keep
+            # us polling rather than raise.
+            settled = settle(key, self.store.lookup(key), request_hash, OnInFlight.WAIT)
+            if settled is not None:
+                return settled
         raise InFlightTimeout(key, self.wait_timeout)

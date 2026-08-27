@@ -12,8 +12,9 @@ Two pieces:
     unchanged: the atomicity guarantee lives in the database, not in how we
     reach it.
 
-The state machine is identical to the sync engine, deliberately. Two
-implementations that drift are two sets of bugs.
+The state machine is not merely identical to the sync engine's — it is the
+same code. Both engines call `justonce.machine.settle`, so there is nothing
+left to drift. Only the await points below are async-specific.
 """
 
 from __future__ import annotations
@@ -24,10 +25,11 @@ import time
 from collections.abc import Awaitable
 from typing import Any, Callable, Protocol, TypeVar, cast, runtime_checkable
 
-from .core import DEFAULT_RETENTION_SECONDS, DEFAULT_TTL_SECONDS, OnInFlight, Result
-from .errors import InFlightTimeout, KeyReuseError, OperationInFlightError
+from .core import DEFAULT_RETENTION_SECONDS, DEFAULT_TTL_SECONDS
+from .errors import InFlightTimeout
 from .keys import fingerprint
-from .stores.base import Claim, Record, State, Store
+from .machine import OnInFlight, Result, settle
+from .stores.base import Claim, Record, Store
 
 T = TypeVar("T")
 
@@ -190,39 +192,21 @@ class AsyncIdempotent:
     async def _resolve_loser(
         self, key: str, request_hash: str, record: Record | None
     ) -> Result:
-        if record is None:
-            raise OperationInFlightError(key)
-        if record.request_hash != request_hash:
-            raise KeyReuseError(key)
-        if record.state is State.SUCCEEDED:
-            return Result(value=record.response, executed=False, record=record)
-        if record.state is State.FAILED:
-            return Result(value=None, executed=False, record=record)
-        if record.state is State.UNKNOWN:
-            raise OperationInFlightError(key)
-        if self.on_in_flight is OnInFlight.RAISE:
-            raise OperationInFlightError(key)
+        settled = settle(key, record, request_hash, self.on_in_flight)
+        if settled is not None:
+            return settled
         return await self._wait_for(key, request_hash)
 
     async def _wait_for(self, key: str, request_hash: str) -> Result:
         deadline = time.monotonic() + self.wait_timeout
         while time.monotonic() < deadline:
             # asyncio.sleep, never time.sleep: blocking here would stall every
-            # other request sharing this event loop.
+            # other request sharing this event loop. This is the only line in
+            # the whole decision path that differs from the sync engine.
             await asyncio.sleep(self.poll_interval)
-            record = await self.store.lookup(key)
-            if record is None:
-                raise OperationInFlightError(key)
-            if record.request_hash != request_hash:
-                raise KeyReuseError(key)
-            if record.is_terminal:
-                return Result(
-                    value=record.response if record.state is State.SUCCEEDED else None,
-                    executed=False,
-                    record=record,
-                )
-            if record.state is State.UNKNOWN:
-                raise OperationInFlightError(key)
+            settled = settle(key, await self.store.lookup(key), request_hash, OnInFlight.WAIT)
+            if settled is not None:
+                return settled
         raise InFlightTimeout(key, self.wait_timeout)
 
 
