@@ -1,7 +1,8 @@
 """Storage backends.
 
 `SqliteStore` is the default and needs no setup. `PostgresStore` is the
-reference implementation for multi-host deployments.
+reference implementation for multi-host deployments. `MemoryStore` is for
+tests, and its docstring says why it is not for anything else.
 
 Adding a backend is the most useful contribution to this project, and the
 contract is small — see `justonce.stores.base.Store` and prove it with
@@ -9,9 +10,10 @@ contract is small — see `justonce.stores.base.Store` and prove it with
 """
 
 from .base import Claim, Record, State, Store
+from .memory import MemoryStore
 from .sqlite import SqliteStore
 
-__all__ = ["Claim", "Record", "SqliteStore", "State", "Store"]
+__all__ = ["Claim", "MemoryStore", "Record", "SqliteStore", "State", "Store"]
 
 
 def __getattr__(name: str) -> object:  # pragma: no cover - import shim

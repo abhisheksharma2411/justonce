@@ -12,7 +12,7 @@ import pytest
 
 from justonce import KeyTooLongError
 from justonce.conformance import StoreConformanceTests
-from justonce.stores import SqliteStore
+from justonce.stores import MemoryStore, SqliteStore
 
 
 class TestSqliteStore(StoreConformanceTests):
@@ -243,3 +243,15 @@ def test_conformance_catches_a_store_that_truncates() -> None:
     contract.test_only_one_concurrent_claimer_wins()
     contract.test_loser_can_read_the_recorded_response()
     contract.test_unknown_is_never_swept()
+
+
+class TestMemoryStore(StoreConformanceTests):
+    """The same contract as every other store, concurrency test included.
+
+    An in-memory store that is not thread-safe is a trap rather than a
+    convenience: it passes a user's single-threaded tests and tells them their
+    concurrent code is fine.
+    """
+
+    def make_store(self) -> MemoryStore:
+        return MemoryStore()

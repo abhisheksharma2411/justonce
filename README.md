@@ -80,6 +80,14 @@ mode you are actually in.
 | `SqliteStore("path.db")` | single host — local dev, tests, a single-instance deployment | you're running more than one machine or worker process |
 | `PostgresStore` | a fleet of workers sharing state, no existing Django app | — |
 | `DjangoStore` | you already run Django and want to reuse its connection | you haven't read the transaction caveat above |
+| `MemoryStore()` | unit-testing a handler without a database | anything else — see below |
+
+`MemoryStore` is a dict behind a lock. It passes the full conformance suite
+including the 24-thread claim race, and it stores responses as JSON exactly as
+the real stores do — so a `datetime` in a response fails in your test rather
+than in production. But every key lives in one process's heap: two workers each
+get a private view in which they both win the claim and both run the effect.
+That is the failure this library exists to prevent, so it is for tests only.
 
 **Durability matters more than it looks like it should, and the default is
 not durable.** `SqliteStore()` defaults to `path=":memory:"`, so a store

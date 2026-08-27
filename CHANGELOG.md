@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`MemoryStore`** — a dict behind a lock, for unit-testing handlers without a
+  database ([#9], [#62]). Passes the full conformance suite, the 24-thread claim
+  race included, because an in-memory store that is not thread-safe passes a
+  user's single-threaded tests and tells them their concurrent code is fine.
+
+  It stores responses as JSON text rather than keeping the object handed in, so
+  a `datetime`, a `Decimal` or a model instance fails here exactly as it would
+  against `SqliteStore` or `PostgresStore`. A double more permissive than
+  production turns a green suite into a false negative. The round trip is also a
+  deep copy, so mutating a response afterwards cannot retroactively change what
+  was recorded.
+
+  Process-local and non-durable by construction: two instances share nothing, so
+  both callers win the claim. The docstring, the README and a test all say so.
+
+
 - The conformance suite now covers key width: a long key must survive intact,
   two long keys differing in one character must not collide, and a store that
   cannot hold a key must refuse it rather than truncate. A store that truncates
@@ -109,6 +125,7 @@ the claim → run → record protocol with atomic claims, divergence detection v
 request fingerprint, `UNKNOWN` state and reconciliation, and the store
 conformance suite.
 
+[#9]: https://github.com/abhisheksharma2411/justonce/issues/9
 [#38]: https://github.com/abhisheksharma2411/justonce/pull/38
 [#39]: https://github.com/abhisheksharma2411/justonce/issues/39
 [#40]: https://github.com/abhisheksharma2411/justonce/issues/40
@@ -119,6 +136,7 @@ conformance suite.
 [#51]: https://github.com/abhisheksharma2411/justonce/issues/51
 [#60]: https://github.com/abhisheksharma2411/justonce/pull/60
 [#61]: https://github.com/abhisheksharma2411/justonce/pull/61
+[#62]: https://github.com/abhisheksharma2411/justonce/pull/62
 [Unreleased]: https://github.com/abhisheksharma2411/justonce/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/abhisheksharma2411/justonce/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/abhisheksharma2411/justonce/releases/tag/v0.1.0
