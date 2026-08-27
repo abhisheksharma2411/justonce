@@ -20,6 +20,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from .errors import KeyTooLongError
 from .stores.base import Record, State, Store
 
 TTL = 60.0
@@ -29,6 +30,19 @@ def _found(record: Record | None) -> Record:
     """Narrow an Optional lookup, failing the test if the record is missing."""
     assert record is not None, "expected a record for this key, store returned None"
     return record
+
+
+def _long_key(store: Store) -> str:
+    """The longest key `store` claims to hold, or 300 characters if unbounded.
+
+    300 is past MySQL's `VARCHAR(255)` and comfortably inside the Postgres
+    btree index limit, so it exercises the interesting case without tripping a
+    different one.
+    """
+    limit = getattr(store, "max_key_length", None)
+    width = 300 if limit is None else int(limit)
+    stem = "charge:v1:"
+    return stem + "a" * (width - len(stem))
 
 
 class StoreConformanceTests:
@@ -218,6 +232,69 @@ class StoreConformanceTests:
         assert _found(store.lookup("k")).state is State.FAILED
 
     # -- misc ---------------------------------------------------------------
+
+    # -- key width ---------------------------------------------------------
+    #
+    # A truncated key is a *collided* key. Two intents sharing a long prefix
+    # collapse onto one, and the second is treated as a replay of the first —
+    # so its effect never runs. That is the worst failure this library has: a
+    # skipped payout, which no alert fires on, unlike a duplicate one.
+
+    def test_a_long_key_survives_intact(self) -> None:
+        """Whatever the store accepts must come back byte-identical.
+
+        Namespaced, versioned keys are long by design — `operation_key` with a
+        couple of UUIDs is already past 140 characters before anyone tries.
+        """
+        store = self.make_store()
+        key = _long_key(store)
+
+        assert store.claim(key, "hash", TTL).won
+        assert _found(store.lookup(key)).key == key, "the store altered the key"
+
+    def test_distinct_long_keys_do_not_collide(self) -> None:
+        """Two keys differing only in their last character are two intents."""
+        store = self.make_store()
+        stem = _long_key(store)[:-1]
+        first, second = stem + "1", stem + "2"
+
+        assert store.claim(first, "hash", TTL).won
+        assert store.claim(second, "hash", TTL).won, (
+            "a distinct key was refused the claim — the store is treating two "
+            "intents as one, and the second effect will never run"
+        )
+
+        # Resolving one must not resolve the other. If the keys collided, the
+        # second lookup reads the first record and reports it terminal.
+        store.complete(first, {"charge": 1})
+        assert _found(store.lookup(second)).state is State.IN_PROGRESS
+
+    def test_an_unstorable_key_is_refused_not_truncated(self) -> None:
+        """A store that cannot hold a key whole must say so, loudly.
+
+        Which way a fixed-width backend fails otherwise is a configuration
+        detail — MySQL truncates or errors depending on `sql_mode` — and a
+        correctness guarantee cannot rest on a session variable.
+        """
+        store = self.make_store()
+        limit = getattr(store, "max_key_length", None)
+        if limit is None:
+            # Unbounded store: the same promise, made the other way. Nothing to
+            # refuse, so prove instead that a key well past any fixed width
+            # round-trips whole.
+            key = "unbounded:" + "k" * 1000
+            assert store.claim(key, "hash", TTL).won
+            assert _found(store.lookup(key)).key == key
+            return
+
+        try:
+            store.claim("x" * (limit + 1), "hash", TTL)
+        except KeyTooLongError:
+            return
+        raise AssertionError(
+            f"store accepted a {limit + 1}-character key with a declared limit "
+            f"of {limit}; it will truncate and collide"
+        )
 
     def test_lookup_missing_key_returns_none(self) -> None:
         assert self.make_store().lookup("nope") is None

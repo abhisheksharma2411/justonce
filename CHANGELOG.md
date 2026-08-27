@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The conformance suite now covers key width: a long key must survive intact,
+  two long keys differing in one character must not collide, and a store that
+  cannot hold a key must refuse it rather than truncate. A store that truncates
+  now fails the contract ([#50], [#61]).
+
 ### Changed (internal)
 
 - **The sync and async engines now share one state machine.** They previously
@@ -20,6 +27,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OnInFlight` and `Result` moved to `justonce.machine` and are re-exported from
   `justonce.core`; imports from either module, and from `justonce`, are
   unaffected.
+
+### Fixed
+
+- **Long keys could be silently truncated on MySQL, and a truncated key is a
+  collided key.** The MySQL DDL declares `key VARCHAR(255)` where Postgres and
+  SQLite use unbounded `TEXT`. Depending on `sql_mode`, MySQL either errored or
+  quietly kept the first 255 characters — and in the quiet case two distinct
+  keys sharing a prefix collapsed onto one, so a second, genuinely different
+  intent was deduplicated away and **its effect never ran**. A skipped payout
+  is worse than a duplicate one, because nothing alerts on it.
+
+  Stores now declare `max_key_length` and refuse a key they cannot hold whole,
+  raising the new `KeyTooLongError` before touching the database. `SqliteStore`
+  and `PostgresStore` are unbounded and unaffected; `DjangoStore` reports 255 on
+  MySQL and unbounded elsewhere, and accepts `max_key_length=` for anyone who
+  has widened the column. The store deliberately does not guess the width: the
+  DDL is `CREATE TABLE IF NOT EXISTS`, so an existing table keeps whatever it
+  was created with ([#50], [#61]).
+
+  Hashing over-length keys was considered and rejected as a default. It would
+  have changed the stored key for existing rows, so a retry arriving after the
+  upgrade would have missed its record and run the effect a second time —
+  causing the exact duplicate this library exists to prevent, at upgrade time.
 
 ## [0.2.0] — 2026-08-21
 
@@ -85,8 +115,10 @@ conformance suite.
 [#57]: https://github.com/abhisheksharma2411/justonce/pull/57
 [#58]: https://github.com/abhisheksharma2411/justonce/pull/58
 [#59]: https://github.com/abhisheksharma2411/justonce/pull/59
+[#50]: https://github.com/abhisheksharma2411/justonce/issues/50
 [#51]: https://github.com/abhisheksharma2411/justonce/issues/51
 [#60]: https://github.com/abhisheksharma2411/justonce/pull/60
+[#61]: https://github.com/abhisheksharma2411/justonce/pull/61
 [Unreleased]: https://github.com/abhisheksharma2411/justonce/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/abhisheksharma2411/justonce/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/abhisheksharma2411/justonce/releases/tag/v0.1.0

@@ -20,7 +20,7 @@ import time
 from typing import Any
 
 from ..errors import StoreError
-from .base import Claim, Record, State, decode_response
+from .base import Claim, Record, State, check_key_length, decode_response
 
 try:  # pragma: no cover - import guard
     import psycopg
@@ -71,6 +71,11 @@ class PostgresStore:
             constraint on `key` is the mechanism, so it belongs under review.
     """
 
+    #: Postgres `TEXT` has no declared width. Very long keys are still bounded
+    #: by the btree index limit (~2704 bytes), which Postgres reports as an
+    #: error rather than by truncating, so there is nothing to guard here.
+    max_key_length: int | None = None
+
     def __init__(self, dsn: str, *, create_schema: bool = True) -> None:
         self._dsn = dsn
         if create_schema:
@@ -86,6 +91,7 @@ class PostgresStore:
     # -- contract -----------------------------------------------------------
 
     def claim(self, key: str, request_hash: str, ttl_seconds: float) -> Claim:
+        check_key_length(key, self.max_key_length, "postgres")
         now = time.time()
         expires = now + ttl_seconds
         try:

@@ -33,6 +33,7 @@ from .errors import (
     InFlightTimeout,
     JustOnceError,
     KeyReuseError,
+    KeyTooLongError,
     OperationInFlightError,
     StoreError,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "InFlightTimeout",
     "JustOnceError",
     "KeyReuseError",
+    "KeyTooLongError",
     "OnInFlight",
     "OperationInFlightError",
     "Record",

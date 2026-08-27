@@ -47,7 +47,7 @@ if not settings.configured:
 
 from django.db import connections, transaction  # noqa: E402
 
-from justonce import Idempotent, operation_key  # noqa: E402
+from justonce import Idempotent, KeyTooLongError, operation_key  # noqa: E402
 from justonce.conformance import StoreConformanceTests  # noqa: E402
 from justonce.stores.django_store import TABLE, DjangoStore  # noqa: E402
 
@@ -162,3 +162,50 @@ class TestDjangoStorePostgres(StoreConformanceTests):
             "ATOMIC_REQUESTS": False,
         }
         return _fresh("pg")
+
+
+class TestKeyWidth:
+    """MySQL is the one bundled backend whose `key` column has a declared width.
+
+    There is no MySQL service in CI (see #41), so the parts that can be checked
+    without a server are checked here: that the guard's number still matches the
+    DDL that sets it, and that the vendor dispatch picks the right one.
+    """
+
+    def test_the_declared_width_matches_the_ddl(self) -> None:
+        """If these drift, the guard waves through keys MySQL then truncates.
+
+        `MYSQL_KEY_LENGTH` exists to be compared against `len(key)` before the
+        insert. Widening the DDL without moving the constant re-opens the bug
+        in the quietest possible way — the guard would still pass, and MySQL
+        would still truncate.
+        """
+        from justonce.stores.django_store import MYSQL_KEY_LENGTH
+
+        ddl = DjangoStore.ddl("mysql")
+        assert f"`key`          VARCHAR({MYSQL_KEY_LENGTH})" in ddl, (
+            f"the MySQL DDL and MYSQL_KEY_LENGTH ({MYSQL_KEY_LENGTH}) disagree:\n{ddl}"
+        )
+
+    def test_auto_follows_the_vendor(self) -> None:
+        """SQLite here, so `auto` must report unbounded rather than MySQL's width."""
+        store = _fresh()
+        assert store.vendor == "sqlite"
+        assert store.max_key_length is None
+
+    def test_an_explicit_width_overrides_auto(self) -> None:
+        """For anyone who widened the column themselves."""
+        assert DjangoStore(max_key_length=768).max_key_length == 768
+        assert DjangoStore(max_key_length=None).max_key_length is None
+
+    def test_an_over_length_key_is_refused_before_the_store_is_touched(self) -> None:
+        """And as `KeyTooLongError`, not wrapped into `StoreError`.
+
+        The distinction matters to the caller: a store failure is worth
+        retrying, a key that cannot be stored is not.
+        """
+        store = DjangoStore(max_key_length=64)
+        with pytest.raises(KeyTooLongError):
+            store.claim("k" * 65, "hash", 60)
+
+        assert store.lookup("k" * 65) is None
