@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Clock skew between hosts could let two of them run the same effect.** A
+  claim's `expires_at` was written from the claiming host's wall clock and the
+  reclaim path compared it against the reading host's. With a fifteen-minute
+  lease and a host thirty minutes fast, that host considered a live claim long
+  expired and reclaimed it while the original holder was still inside the
+  effect. The claim is atomic, so only one row changed — but both callers
+  believed they held it, which is the duplicate this library exists to prevent.
+  NTP drift of a second or two is normal; minutes happen after a VM resume or
+  with a broken time daemon ([#47], [#63]).
+
+  Every timestamp now comes from the store's clock rather than the caller's,
+  computed inside the statement that uses it: `clock_timestamp()` on Postgres,
+  `UNIX_TIMESTAMP(NOW(6))` on MySQL, `julianday('now')` on SQLite. Postgres uses
+  `clock_timestamp()` rather than `now()` deliberately — `now()` is the
+  *transaction's* start time, and `DjangoStore` shares the caller's ambient
+  transaction, so a claim inside a long transaction would have measured its
+  lease from whenever that transaction opened.
+
+  `sweep()` and `unresolved()` take `None` to mean the store's clock, and the
+  engines now pass that through by default. A sweeper on a fast host was able to
+  delete records still inside their retention window, and a swept record is a
+  key the next delivery of the same request cannot find.
+
+  Stores expose `now()` and declare `clock`. `MemoryStore` declares
+  `clock = "process"`: it has no clock but the caller's, which is harmless only
+  because it is single-process, and a conformance test asserts that rather than
+  skipping it.
+
+
+
 ### Added
 
 - **`MemoryStore`** — a dict behind a lock, for unit-testing handlers without a
@@ -137,6 +169,8 @@ conformance suite.
 [#60]: https://github.com/abhisheksharma2411/justonce/pull/60
 [#61]: https://github.com/abhisheksharma2411/justonce/pull/61
 [#62]: https://github.com/abhisheksharma2411/justonce/pull/62
+[#47]: https://github.com/abhisheksharma2411/justonce/issues/47
+[#63]: https://github.com/abhisheksharma2411/justonce/pull/63
 [Unreleased]: https://github.com/abhisheksharma2411/justonce/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/abhisheksharma2411/justonce/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/abhisheksharma2411/justonce/releases/tag/v0.1.0

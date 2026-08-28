@@ -33,7 +33,6 @@ loudly in `__init__` when it detects the risky combination.
 from __future__ import annotations
 
 import json
-import time
 from typing import Any, Literal
 
 from ..errors import StoreError
@@ -113,24 +112,49 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
 )""",
 }
 
+#: Each vendor's own clock, as a Unix timestamp. Never the caller's — see
+#: `justonce.stores.base.Store.now` for why that distinction is the whole point.
+#:
+#: Postgres uses `clock_timestamp()`, not `now()`/`CURRENT_TIMESTAMP`: those are
+#: the *transaction's* start time and stay constant for its duration, and this
+#: store shares the caller's ambient transaction by default, so a claim taken
+#: inside a long-running transaction would measure its lease from whenever that
+#: transaction opened.
+#:
+#: MySQL's `NOW(6)` is the statement's start time, which is what we want, and is
+#: replication-safe in a way `SYSDATE(6)` is not.
+_NOW = {
+    "postgresql": "EXTRACT(EPOCH FROM clock_timestamp())",
+    "mysql": "UNIX_TIMESTAMP(NOW(6))",
+    "sqlite": "((julianday('now') - 2440587.5) * 86400.0)",
+}
+
 #: The atomic claim, per vendor. Every one of these is a single statement whose
 #: winner is decided by the unique constraint — never a SELECT then an INSERT.
-_INSERT = {
-    "postgresql": (
-        f"INSERT INTO {TABLE} (key, state, request_hash, created_at, updated_at, expires_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (key) DO NOTHING"
-    ),
-    "sqlite": (
-        f"INSERT INTO {TABLE} (key, state, request_hash, created_at, updated_at, expires_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT(key) DO NOTHING"
-    ),
-    # MySQL has no ON CONFLICT DO NOTHING. INSERT IGNORE suppresses the duplicate
-    # -key error and reports 0 affected rows, which is the same signal.
-    "mysql": (
-        f"INSERT IGNORE INTO {TABLE} (`key`, state, request_hash, created_at, updated_at, "
-        "expires_at) VALUES (%s, %s, %s, %s, %s, %s)"
-    ),
-}
+def _insert(vendor: str) -> str:
+    """The atomic claim for `vendor`, with the timestamps taken server-side.
+
+    Built per call rather than held in a dict because the clock expression is
+    interpolated into it, and a `{TABLE}`-style constant that also carries SQL
+    from `_NOW` is easier to read as a function than as a formatted literal.
+    """
+    now = _NOW[vendor]
+    cols = "created_at, updated_at, expires_at"
+    times = f"{now}, {now}, {now} + %s"
+    if vendor == "mysql":
+        # MySQL has no ON CONFLICT DO NOTHING. INSERT IGNORE suppresses the
+        # duplicate-key error and reports 0 affected rows, which is the same signal.
+        return (
+            f"INSERT IGNORE INTO {TABLE} (`key`, state, request_hash, {cols}) "
+            f"VALUES (%s, %s, %s, {times})"
+        )
+    conflict = (
+        "ON CONFLICT (key) DO NOTHING" if vendor == "postgresql" else "ON CONFLICT(key) DO NOTHING"
+    )
+    return (
+        f"INSERT INTO {TABLE} (key, state, request_hash, {cols}) "
+        f"VALUES (%s, %s, %s, {times}) {conflict}"
+    )
 
 
 class DjangoStore:
@@ -162,6 +186,17 @@ class DjangoStore:
         if create_table:
             self.create_table()
 
+    #: Times come from the database server, which is the one clock every host
+    #: talking to it shares.
+    clock = "store"
+
+    def now(self) -> float:
+        """The database server's clock. See `justonce.stores.base.Store.now`."""
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT {_NOW[self.vendor]}")
+            row = cur.fetchone()
+        return float(row[0])
+
     @property
     def max_key_length(self) -> int | None:
         """Longest key this backend stores whole; `None` when unbounded.
@@ -183,7 +218,7 @@ class DjangoStore:
     @property
     def vendor(self) -> str:
         v: str = self._conn.vendor
-        if v not in _INSERT:
+        if v not in _NOW:
             raise StoreError(
                 f"DjangoStore has no atomic-claim statement for the {v!r} backend. "
                 "A store without an atomic claim is not a store — please open an "
@@ -228,13 +263,12 @@ class DjangoStore:
         # Before the try: a key this store cannot hold is the caller's bug, not
         # a store failure, and must not be reported as `StoreError`.
         check_key_length(key, self.max_key_length, self.vendor)
-        now = time.time()
-        expires = now + ttl_seconds
+        now_sql = _NOW[self.vendor]
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    _INSERT[self.vendor],
-                    [key, State.IN_PROGRESS.value, request_hash, now, now, expires],
+                    _insert(self.vendor),
+                    [key, State.IN_PROGRESS.value, request_hash, ttl_seconds],
                 )
                 if cur.rowcount == 1:
                     return Claim(won=True, record=self._get(cur, key))
@@ -247,13 +281,14 @@ class DjangoStore:
                 # optimisation. Without it this UPDATE overwrites the stored
                 # hash and a *different* payload inherits the key and executes.
                 cur.execute(
-                    f"UPDATE {TABLE} SET state = %s, request_hash = %s, updated_at = %s, "
-                    "expires_at = %s, attempts = attempts + 1, response = NULL "
+                    f"UPDATE {TABLE} SET state = %s, request_hash = %s, "
+                    f"updated_at = {now_sql}, expires_at = {now_sql} + %s, "
+                    "attempts = attempts + 1, response = NULL "
                     f"WHERE {self._key_col} = %s AND state = %s AND request_hash = %s "
-                    "AND expires_at IS NOT NULL AND expires_at < %s",
+                    f"AND expires_at IS NOT NULL AND expires_at < {now_sql}",
                     [
-                        State.IN_PROGRESS.value, request_hash, now, expires,
-                        key, State.IN_PROGRESS.value, request_hash, now,
+                        State.IN_PROGRESS.value, request_hash, ttl_seconds,
+                        key, State.IN_PROGRESS.value, request_hash,
                     ],
                 )
                 if cur.rowcount == 1:
@@ -275,31 +310,39 @@ class DjangoStore:
     def mark_unknown(self, key: str) -> None:
         with self._conn.cursor() as cur:
             cur.execute(
-                f"UPDATE {TABLE} SET state = %s, updated_at = %s, expires_at = NULL "
-                f"WHERE {self._key_col} = %s",
-                [State.UNKNOWN.value, time.time(), key],
+                f"UPDATE {TABLE} SET state = %s, updated_at = {_NOW[self.vendor]}, "
+                f"expires_at = NULL WHERE {self._key_col} = %s",
+                [State.UNKNOWN.value, key],
             )
 
     def lookup(self, key: str) -> Record | None:
         with self._conn.cursor() as cur:
             return self._get(cur, key)
 
-    def sweep(self, *, before: float) -> int:
+    def sweep(self, *, before: float | None = None) -> int:
+        cutoff = _NOW[self.vendor] if before is None else "%s"
+        params: list[Any] = [State.SUCCEEDED.value, State.FAILED.value]
+        if before is not None:
+            params.append(before)
         with self._conn.cursor() as cur:
             cur.execute(
                 f"DELETE FROM {TABLE} WHERE state IN (%s, %s) "
-                "AND expires_at IS NOT NULL AND expires_at < %s",
-                [State.SUCCEEDED.value, State.FAILED.value, before],
+                f"AND expires_at IS NOT NULL AND expires_at < {cutoff}",
+                params,
             )
             return int(cur.rowcount)
 
     def unresolved(self, *, older_than: float | None = None, limit: int = 100) -> list[Record]:
-        cutoff = older_than if older_than is not None else time.time()
+        cutoff = _NOW[self.vendor] if older_than is None else "%s"
+        params: list[Any] = [State.UNKNOWN.value]
+        if older_than is not None:
+            params.append(older_than)
+        params.append(limit)
         with self._conn.cursor() as cur:
             cur.execute(
-                f"SELECT {self._cols} FROM {TABLE} WHERE state = %s AND updated_at <= %s "
-                "ORDER BY updated_at ASC LIMIT %s",
-                [State.UNKNOWN.value, cutoff, limit],
+                f"SELECT {self._cols} FROM {TABLE} WHERE state = %s "
+                f"AND updated_at <= {cutoff} ORDER BY updated_at ASC LIMIT %s",
+                params,
             )
             return [self._row(r) for r in cur.fetchall()]
 
@@ -332,19 +375,20 @@ class DjangoStore:
         # `expires_at` is replaced, never left alone — see the note in the
         # SQLite store. A terminal record still holding its claim lease gets
         # swept one claim-TTL after it was written, whatever retention says.
-        now = time.time()
-        expires = None if retention_seconds is None else now + retention_seconds
+        now_sql = _NOW[self.vendor]
+        expiry = "NULL" if retention_seconds is None else f"{now_sql} + %s"
+        params: list[Any] = [
+            state.value,
+            json.dumps(response) if response is not None else None,
+        ]
+        if retention_seconds is not None:
+            params.append(retention_seconds)
+        params.append(key)
         with self._conn.cursor() as cur:
             cur.execute(
-                f"UPDATE {TABLE} SET state = %s, response = %s, updated_at = %s, expires_at = %s "
-                f"WHERE {self._key_col} = %s",
-                [
-                    state.value,
-                    json.dumps(response) if response is not None else None,
-                    now,
-                    expires,
-                    key,
-                ],
+                f"UPDATE {TABLE} SET state = %s, response = %s, updated_at = {now_sql}, "
+                f"expires_at = {expiry} WHERE {self._key_col} = %s",
+                params,
             )
 
     def _get(self, cur: Any, key: str) -> Record | None:

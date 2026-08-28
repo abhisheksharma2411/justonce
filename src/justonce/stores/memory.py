@@ -46,6 +46,11 @@ class MemoryStore:
     #: A dict key has no width, so nothing is ever truncated.
     max_key_length: int | None = None
 
+    #: This process's clock, because the store *is* this process. Cross-host
+    #: skew is not a hazard here for the same reason durability is not a
+    #: feature: nothing outside this interpreter can reach the data.
+    clock = "process"
+
     def __init__(self) -> None:
         # RLock rather than Lock: `claim` calls `_get` while holding it, and a
         # plain Lock would deadlock the moment either grows a second internal
@@ -54,6 +59,10 @@ class MemoryStore:
         self._rows: dict[str, dict[str, Any]] = {}
 
     # -- contract -----------------------------------------------------------
+
+    def now(self) -> float:
+        """This process's clock. See `justonce.stores.base.Store.now`."""
+        return time.time()
 
     def claim(self, key: str, request_hash: str, ttl_seconds: float) -> Claim:
         check_key_length(key, self.max_key_length, "memory")
@@ -127,14 +136,15 @@ class MemoryStore:
         with self._lock:
             return self._get(key)
 
-    def sweep(self, *, before: float) -> int:
+    def sweep(self, *, before: float | None = None) -> int:
+        cutoff = time.time() if before is None else before
         with self._lock:
             doomed = [
                 k
                 for k, row in self._rows.items()
                 if row["state"] in (State.SUCCEEDED.value, State.FAILED.value)
                 and row["expires_at"] is not None
-                and row["expires_at"] < before
+                and row["expires_at"] < cutoff
             ]
             for k in doomed:
                 del self._rows[k]

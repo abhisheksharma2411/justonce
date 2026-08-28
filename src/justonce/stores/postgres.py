@@ -16,7 +16,6 @@ to decide who holds a lock just moves the race.
 from __future__ import annotations
 
 import json
-import time
 from typing import Any
 
 from ..errors import StoreError
@@ -33,6 +32,16 @@ except ImportError as exc:  # pragma: no cover
 #: Must stay identical to the Postgres DDL in `django_store` — same table, same
 #: column types. Both are `CREATE TABLE IF NOT EXISTS`, so whichever store runs
 #: first in a shared database decides the shape and the other inherits it.
+#: Postgres's clock, as a Unix timestamp.
+#:
+#: `clock_timestamp()` rather than `now()`/`CURRENT_TIMESTAMP` on purpose: those
+#: return the *transaction's* start time and are constant for its duration, so a
+#: claim taken inside a long-running transaction would measure its lease from
+#: whenever that transaction opened. `DjangoStore` shares the caller's ambient
+#: transaction by default, which makes that a real deployment rather than a
+#: hypothetical one.
+_NOW = "EXTRACT(EPOCH FROM clock_timestamp())"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS justonce_keys (
     key           TEXT        PRIMARY KEY,
@@ -71,6 +80,10 @@ class PostgresStore:
             constraint on `key` is the mechanism, so it belongs under review.
     """
 
+    #: Times come from the Postgres server, which is the one clock every host
+    #: talking to it shares.
+    clock = "store"
+
     #: Postgres `TEXT` has no declared width. Very long keys are still bounded
     #: by the btree index limit (~2704 bytes), which Postgres reports as an
     #: error rather than by truncating, so there is nothing to guard here.
@@ -90,21 +103,25 @@ class PostgresStore:
 
     # -- contract -----------------------------------------------------------
 
+    def now(self) -> float:
+        """The Postgres server's clock. See `justonce.stores.base.Store.now`."""
+        with self._connect() as conn:
+            row = conn.execute(f"SELECT {_NOW} AS now").fetchone()
+        return float(row["now"])
+
     def claim(self, key: str, request_hash: str, ttl_seconds: float) -> Claim:
         check_key_length(key, self.max_key_length, "postgres")
-        now = time.time()
-        expires = now + ttl_seconds
         try:
             with self._connect() as conn:
                 row = conn.execute(
-                    """
+                    f"""
                     INSERT INTO justonce_keys
                         (key, state, request_hash, created_at, updated_at, expires_at)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, {_NOW}, {_NOW}, {_NOW} + %s)
                     ON CONFLICT (key) DO NOTHING
                     RETURNING key
                     """,
-                    (key, State.IN_PROGRESS.value, request_hash, now, now, expires),
+                    (key, State.IN_PROGRESS.value, request_hash, ttl_seconds),
                 ).fetchone()
                 if row is not None:
                     return Claim(won=True, record=self._get(conn, key))
@@ -115,20 +132,21 @@ class PostgresStore:
                 # A caller whose hash differs must lose and meet the original
                 # hash on the record.
                 row = conn.execute(
-                    """
+                    f"""
                     UPDATE justonce_keys
-                       SET state = %s, request_hash = %s, updated_at = %s,
-                           expires_at = %s, attempts = attempts + 1, response = NULL
+                       SET state = %s, request_hash = %s, updated_at = {_NOW},
+                           expires_at = {_NOW} + %s, attempts = attempts + 1,
+                           response = NULL
                      WHERE key = %s
                        AND state = %s
                        AND request_hash = %s
                        AND expires_at IS NOT NULL
-                       AND expires_at < %s
+                       AND expires_at < {_NOW}
                     RETURNING key
                     """,
                     (
-                        State.IN_PROGRESS.value, request_hash, now, expires,
-                        key, State.IN_PROGRESS.value, request_hash, now,
+                        State.IN_PROGRESS.value, request_hash, ttl_seconds,
+                        key, State.IN_PROGRESS.value, request_hash,
                     ),
                 ).fetchone()
                 if row is not None:
@@ -150,41 +168,49 @@ class PostgresStore:
     def mark_unknown(self, key: str) -> None:
         with self._connect() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE justonce_keys
-                   SET state = %s, updated_at = %s, expires_at = NULL
+                   SET state = %s, updated_at = {_NOW}, expires_at = NULL
                  WHERE key = %s
                 """,
-                (State.UNKNOWN.value, time.time(), key),
+                (State.UNKNOWN.value, key),
             )
 
     def lookup(self, key: str) -> Record | None:
         with self._connect() as conn:
             return self._get(conn, key)
 
-    def sweep(self, *, before: float) -> int:
+    def sweep(self, *, before: float | None = None) -> int:
+        cutoff = _NOW if before is None else "%s"
+        params: list[Any] = [State.SUCCEEDED.value, State.FAILED.value]
+        if before is not None:
+            params.append(before)
         with self._connect() as conn:
             cur = conn.execute(
-                """
+                f"""
                 DELETE FROM justonce_keys
                  WHERE state IN (%s, %s)
                    AND expires_at IS NOT NULL
-                   AND expires_at < %s
+                   AND expires_at < {cutoff}
                 """,
-                (State.SUCCEEDED.value, State.FAILED.value, before),
+                params,
             )
             return int(cur.rowcount)
 
     def unresolved(self, *, older_than: float | None = None, limit: int = 100) -> list[Record]:
-        cutoff = older_than if older_than is not None else time.time()
+        cutoff = _NOW if older_than is None else "%s"
+        params: list[Any] = [State.UNKNOWN.value]
+        if older_than is not None:
+            params.append(older_than)
+        params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
                 SELECT {_COLUMNS} FROM justonce_keys
-                 WHERE state = %s AND updated_at <= %s
+                 WHERE state = %s AND updated_at <= {cutoff}
                  ORDER BY updated_at ASC LIMIT %s
                 """,
-                (State.UNKNOWN.value, cutoff, limit),
+                params,
             ).fetchall()
         return [self._row(r) for r in rows]
 
@@ -196,17 +222,20 @@ class PostgresStore:
         # `expires_at` is replaced, never left alone — see the note in the
         # SQLite store. A terminal record still holding its claim lease gets
         # swept one claim-TTL after it was written, whatever retention says.
-        now = time.time()
-        expires = None if retention_seconds is None else now + retention_seconds
+        encoded = json.dumps(response) if response is not None else None
+        expiry = "NULL" if retention_seconds is None else f"{_NOW} + %s"
+        params: list[Any] = [state.value, encoded]
+        if retention_seconds is not None:
+            params.append(retention_seconds)
+        params.append(key)
         with self._connect() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE justonce_keys
-                   SET state = %s, response = %s, updated_at = %s, expires_at = %s
+                   SET state = %s, response = %s, updated_at = {_NOW}, expires_at = {expiry}
                  WHERE key = %s
                 """,
-                (state.value, json.dumps(response) if response is not None else None,
-                 now, expires, key),
+                params,
             )
 
     @staticmethod

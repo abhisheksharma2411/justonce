@@ -122,6 +122,37 @@ justonce.configure(store, on_in_flight=justonce.OnInFlight.WAIT)    # block for 
 
 Never let a second caller proceed because the first "seems stuck" — a stalled attempt whose fate is unknown is exactly when duplicating is most expensive.
 
+### Clocks, and why the lease is not measured on yours
+
+A claim's lease is written by one host and judged expired by another. If each
+measured it against its own wall clock, the lease would mean different things to
+each of them — and the atomic claim would not save you. Host B decides host A's
+claim expired, A is still running the effect, both proceed, and the effect runs
+twice.
+
+So **every timestamp comes from the store's clock, never the caller's**. The
+stores compute `now` inside SQL — `clock_timestamp()` on Postgres,
+`UNIX_TIMESTAMP(NOW(6))` on MySQL, `julianday('now')` on SQLite — so the one
+clock every host shares is the database's:
+
+```python
+store.now()          # the database server's clock, as a Unix timestamp
+store.clock          # "store", or "process" for MemoryStore
+```
+
+NTP skew of a second or two is normal. Minutes happen after a VM resume or with
+a broken time daemon, and a fifteen-minute default lease does not survive a
+thirty-minute skew.
+
+`sweep()` follows the same rule: called with no argument it defers to the store's
+clock, because a sweeper on a fast host would otherwise delete records still
+inside their retention window — and a swept record is a key the next delivery
+cannot find, so the effect runs again.
+
+`MemoryStore` is the exception and declares it with `clock = "process"`. It has
+no clock but the caller's, which is harmless only because no second process can
+reach it to disagree.
+
 ### Reconciliation
 
 Prevention is never complete. When a process dies *between* the effect and recording it, the key is left `UNKNOWN` rather than cleaned up — because "we don't know whether the customer was charged" is a fact worth keeping.
