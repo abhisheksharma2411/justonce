@@ -111,6 +111,16 @@ class Claim:
 class Store(Protocol):
     """Persistence contract for claims and their outcomes.
 
+    **Every time a store records or compares belongs to the store's own clock,
+    never to the calling process's.** A lease written by one host and judged
+    expired by another is only meaningful if one clock governs both, and the
+    only clock both hosts share is the database's. See `now()`.
+
+    Stores may also expose ``clock: str`` — ``"store"`` when `now()` comes from
+    a shared authority such as a database server (the default assumption), or
+    ``"process"`` when it is this process's own clock and cross-host skew is
+    therefore not a thing that can happen.
+
     Stores may also expose ``max_key_length: int | None`` — the longest key the
     backing column holds whole, or `None` for unbounded. It is read with
     `getattr`, so it is optional and existing stores keep working; declaring it
@@ -118,6 +128,28 @@ class Store(Protocol):
     `check_key_length`. A store that leaves it unset is asserting its key
     column cannot truncate.
     """
+
+    def now(self) -> float:
+        """The clock this store measures leases against, as a Unix timestamp.
+
+        For a store backed by a shared database this is the *database server's*
+        clock, not the caller's. That is the whole point: `claim` writes
+        `expires_at` from it and the reclaim path compares against it, so a
+        lease means the same thing to every host that can reach the store, even
+        when their own clocks disagree.
+
+        NTP skew of a second or two is normal; minutes happen after a VM
+        resume or with a broken time daemon. Measured against the caller's
+        clock, a host running fast considers a live claim expired and reclaims
+        it while the original holder is still running the effect — and the
+        claim being atomic does not help, because both callers then believe
+        they hold it and the effect runs twice.
+
+        A single-process store has no clock but the caller's; it says so with
+        `clock = "process"` and is unaffected, because no second process can
+        reach it to disagree.
+        """
+        ...
 
     def claim(self, key: str, request_hash: str, ttl_seconds: float) -> Claim:
         """Atomically claim `key`, or report that someone else holds it.
@@ -182,8 +214,11 @@ class Store(Protocol):
         """Return the record for `key`, or None."""
         ...
 
-    def sweep(self, *, before: float) -> int:
+    def sweep(self, *, before: float | None = None) -> int:
         """Delete terminal records that expired before `before`; return the count.
+
+        `before=None` means the store's own clock — see `now()`. Passing a value
+        is for tests and for deliberately sweeping to a past or future cutoff.
 
         Must never delete `IN_PROGRESS` or `UNKNOWN` records — an unresolved
         outcome that gets swept is a duplicate charge nobody can trace.

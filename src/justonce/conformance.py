@@ -17,7 +17,9 @@ else and fails that one is not a store — it is a cache with extra steps.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import Any
 
 from .errors import KeyTooLongError
@@ -30,6 +32,24 @@ def _found(record: Record | None) -> Record:
     """Narrow an Optional lookup, failing the test if the record is missing."""
     assert record is not None, "expected a record for this key, store returned None"
     return record
+
+
+@contextmanager
+def _process_clock_ahead_by(seconds: float) -> Iterator[None]:
+    """Run the block with this process's `time.time()` moved forward.
+
+    Patches the module attribute the stores would read, so a store that takes
+    its timestamps from the caller follows the skew and one that asks its
+    database does not. Deliberately global and deliberately narrow: the point is
+    that a store cannot opt out of it, which a clock injected through the
+    constructor would let it do.
+    """
+    real = time.time
+    try:
+        time.time = lambda: real() + seconds
+        yield
+    finally:
+        time.time = real
 
 
 def _long_key(store: Store) -> str:
@@ -232,6 +252,58 @@ class StoreConformanceTests:
         assert _found(store.lookup("k")).state is State.FAILED
 
     # -- misc ---------------------------------------------------------------
+
+    # -- clock ---------------------------------------------------------------
+    #
+    # A lease is written by one host and judged expired by another. If each
+    # measures it against its own wall clock, the lease means different things
+    # to each of them, and the atomic claim does not save you: host B decides
+    # A's claim expired while A is still running the effect, B reclaims, and
+    # the effect runs twice. NTP skew of seconds is normal; minutes happen
+    # after a VM resume or with a broken time daemon.
+
+    def test_a_lease_is_measured_against_a_clock_the_caller_does_not_control(self) -> None:
+        """A caller whose clock runs fast must not be able to steal a live claim.
+
+        Simulates the second host by moving this process's clock forward half an
+        hour, which is skew far beyond anything NTP would leave but well inside
+        what a resumed VM produces. The claim below has a fifteen-minute lease,
+        so a store trusting the caller's clock sees it as long expired.
+        """
+        store = self.make_store()
+        store.claim("skew", "hash", 900)
+
+        with _process_clock_ahead_by(1800):
+            stolen = store.claim("skew", "hash", 900).won
+
+        if getattr(store, "clock", "store") == "process":
+            # A single-process store has no clock but this one, so it does follow
+            # the skew — and that is harmless, because no second process can
+            # reach this store to disagree with it. Asserted rather than skipped,
+            # so the exemption stays honest if the store ever becomes shared.
+            assert stolen is True
+            return
+
+        assert stolen is False, (
+            "a caller with a fast clock reclaimed a live lease — the store is "
+            "measuring the lease against the caller's clock rather than its own, "
+            "so two hosts will run the same effect"
+        )
+
+    def test_the_stores_clock_does_not_follow_the_callers(self) -> None:
+        """The mechanism behind the test above, asserted directly."""
+        store = self.make_store()
+        if getattr(store, "clock", "store") == "process":
+            # It *does* follow the caller, by construction. Asserted rather than
+            # skipped so the claim stays a measurement instead of a comment.
+            with _process_clock_ahead_by(1800):
+                assert abs(store.now() - time.time()) < 5
+            return
+
+        with _process_clock_ahead_by(1800):
+            drift = store.now() - time.time()
+        # The store's clock stayed put while the caller's jumped 1800s forward.
+        assert drift < -1500, f"the store's clock moved with the caller's (drift {drift:.0f}s)"
 
     # -- key width ---------------------------------------------------------
     #

@@ -52,7 +52,7 @@ class AsyncStore(Protocol):
     ) -> None: ...
     async def mark_unknown(self, key: str) -> None: ...
     async def lookup(self, key: str) -> Record | None: ...
-    async def sweep(self, *, before: float) -> int: ...
+    async def sweep(self, *, before: float | None = None) -> int: ...
     async def unresolved(
         self, *, older_than: float | None = None, limit: int = 100
     ) -> list[Record]: ...
@@ -103,7 +103,7 @@ class ThreadedStore:
     async def lookup(self, key: str) -> Record | None:
         return await asyncio.to_thread(self._store.lookup, key)
 
-    async def sweep(self, *, before: float) -> int:
+    async def sweep(self, *, before: float | None = None) -> int:
         return await asyncio.to_thread(functools.partial(self._store.sweep, before=before))
 
     async def unresolved(
@@ -182,7 +182,8 @@ class AsyncIdempotent:
         return Result(value=value, executed=True, record=await self.store.lookup(key))
 
     async def sweep(self, *, now: float | None = None) -> int:
-        return await self.store.sweep(before=now if now is not None else time.time())
+        """See `Idempotent.sweep`. `now=None` defers to the store's clock."""
+        return await self.store.sweep(before=now)
 
     async def unresolved(self, *, limit: int = 100) -> list[Record]:
         return await self.store.unresolved(limit=limit)

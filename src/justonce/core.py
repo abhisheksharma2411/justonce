@@ -133,9 +133,14 @@ class Idempotent:
         return Result(value=value, executed=True, record=self.store.lookup(key))
 
     def sweep(self, *, now: float | None = None) -> int:
-        """Delete terminal records past their retention window."""
-        cutoff = (now if now is not None else time.time())
-        return self.store.sweep(before=cutoff)
+        """Delete terminal records past their retention window.
+
+        `now=None` lets the *store's* clock decide, which is the point: a
+        sweeper running on a host whose clock is fast would otherwise delete
+        records that have not actually expired, and a swept record is a key the
+        next delivery of the same request cannot find.
+        """
+        return self.store.sweep(before=now)
 
     def unresolved(self, *, limit: int = 100) -> list[Record]:
         """Effects whose outcome was never observed — reconciliation's input."""
