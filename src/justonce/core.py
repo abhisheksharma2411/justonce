@@ -21,7 +21,7 @@ from typing import Any, Callable, TypeVar
 
 from .errors import InFlightTimeout
 from .keys import fingerprint
-from .machine import OnInFlight, Result, settle
+from .machine import OnInFlight, OnStoreUnavailable, Result, settle, unguarded_run_allowed
 from .stores.base import Record, Store
 
 T = TypeVar("T")
@@ -46,6 +46,7 @@ __all__ = [
     "DEFAULT_TTL_SECONDS",
     "Idempotent",
     "OnInFlight",
+    "OnStoreUnavailable",
     "Result",
 ]
 
@@ -59,6 +60,9 @@ class Idempotent:
         on_in_flight: behaviour when another caller holds the claim.
         wait_timeout: bound for `OnInFlight.WAIT`.
         retention_seconds: how long terminal records are kept for `sweep`.
+        on_store_unavailable: behaviour when the store cannot be reached at
+            all. Fail-closed by default, and changing it is a decision about
+            duplicate effects — read `OnStoreUnavailable` before you do.
     """
 
     def __init__(
@@ -70,6 +74,7 @@ class Idempotent:
         wait_timeout: float = 30.0,
         poll_interval: float = 0.05,
         retention_seconds: float = DEFAULT_RETENTION_SECONDS,
+        on_store_unavailable: OnStoreUnavailable = OnStoreUnavailable.FAIL_CLOSED,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
@@ -79,6 +84,7 @@ class Idempotent:
         self.wait_timeout = wait_timeout
         self.poll_interval = poll_interval
         self.retention_seconds = retention_seconds
+        self.on_store_unavailable = on_store_unavailable
 
     def run(
         self,
@@ -101,9 +107,16 @@ class Idempotent:
         Raises:
             KeyReuseError: same key, different payload.
             OperationInFlightError: another caller holds the claim.
+            StoreError: the store could not be reached, under the default
+                `OnStoreUnavailable.FAIL_CLOSED`.
         """
         request_hash = fingerprint(payload)
-        claim = self.store.claim(key, request_hash, self.ttl_seconds)
+        try:
+            claim = self.store.claim(key, request_hash, self.ttl_seconds)
+        except BaseException as exc:
+            if not unguarded_run_allowed(exc, self.on_store_unavailable):
+                raise
+            return self._run_unguarded(effect)
 
         if claim.lost:
             return self._resolve_loser(key, request_hash, claim.record)
@@ -147,6 +160,21 @@ class Idempotent:
         return self.store.unresolved(limit=limit)
 
     # -- internals ----------------------------------------------------------
+
+    def _run_unguarded(self, effect: Callable[[], T]) -> Result:
+        """Run the effect with no claim behind it. See `OnStoreUnavailable`.
+
+        Nothing is written afterwards, on either the success or the failure
+        path. A `complete` for a key this caller never claimed is not a partial
+        record, it is a false one: the store may be reachable again by then, or
+        may have been reachable from another host all along, and the row this
+        would overwrite could belong to a holder that actually won the claim.
+
+        The consequence is that an unguarded run leaves no trace in the ledger,
+        which is why `Result.guarded` is False — that flag is the only record
+        the caller gets, so the caller has to be the one to keep it.
+        """
+        return Result(value=effect(), executed=True, record=None, guarded=False)
 
     def _resolve_loser(self, key: str, request_hash: str, record: Record | None) -> Result:
         settled = settle(key, record, request_hash, self.on_in_flight)

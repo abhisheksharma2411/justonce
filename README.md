@@ -122,6 +122,49 @@ justonce.configure(store, on_in_flight=justonce.OnInFlight.WAIT)    # block for 
 
 Never let a second caller proceed because the first "seems stuck" — a stalled attempt whose fate is unknown is exactly when duplicating is most expensive.
 
+### When the store itself is down
+
+The database is unreachable, so nothing can answer "has this already run?".
+justonce **fails closed**: `claim()` raises `StoreError` and the request fails.
+
+That is a stated decision, not an accident. It means an outage in the dedup
+layer becomes an outage in whatever it guards — payments stop while the
+database is down — and it is the only behaviour that cannot produce a duplicate
+charge.
+
+The alternative is available, opt-in, and named so nobody reaches it by
+accident:
+
+```python
+justonce.configure(store, on_store_unavailable=justonce.OnStoreUnavailable.FAIL_OPEN)
+```
+
+**Fail-open runs the effect with nothing in the way, and duplicates become
+possible.** Not unlikely — possible, and concentrated exactly where they hurt.
+A store outage is when retries are most frequent, because everything upstream
+is already erroring and retrying, and every one of those retries applies the
+effect again. This is how a database outage becomes a finance incident. Choose
+it only for effects that genuinely tolerate being applied twice.
+
+Two things stay true even under fail-open:
+
+* **It covers the claim only.** If the claim succeeded and the *outcome write*
+  failed, the effect has already run and the honest answer is `UNKNOWN`, for
+  reconciliation to resolve. Fail-open never converts that into a silent
+  success.
+* **It is never inferred.** Only `StoreError` opens the gate. A `KeyTooLongError`
+  also comes out of `claim`, and it means the key is about to be truncated into
+  a collision with a different intent — running the effect is the worst possible
+  response to it, so it propagates exactly as it does today.
+
+A run that happened without a claim says so, which is the only trace it leaves:
+
+```python
+result = engine.run(key, effect)
+if not result.guarded:
+    alert("effect ran with idempotency disabled", key=key)
+```
+
 ### Clocks, and why the lease is not measured on yours
 
 A claim's lease is written by one host and judged expired by another. If each

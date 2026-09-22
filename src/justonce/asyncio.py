@@ -28,7 +28,7 @@ from typing import Any, Callable, Protocol, TypeVar, cast, runtime_checkable
 from .core import DEFAULT_RETENTION_SECONDS, DEFAULT_TTL_SECONDS
 from .errors import InFlightTimeout
 from .keys import fingerprint
-from .machine import OnInFlight, Result, settle
+from .machine import OnInFlight, OnStoreUnavailable, Result, settle, unguarded_run_allowed
 from .stores.base import Claim, Record, Store
 
 T = TypeVar("T")
@@ -130,6 +130,7 @@ class AsyncIdempotent:
         wait_timeout: float = 30.0,
         poll_interval: float = 0.05,
         retention_seconds: float = DEFAULT_RETENTION_SECONDS,
+        on_store_unavailable: OnStoreUnavailable = OnStoreUnavailable.FAIL_CLOSED,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
@@ -142,6 +143,7 @@ class AsyncIdempotent:
         self.wait_timeout = wait_timeout
         self.poll_interval = poll_interval
         self.retention_seconds = retention_seconds
+        self.on_store_unavailable = on_store_unavailable
 
     async def run(
         self,
@@ -153,7 +155,14 @@ class AsyncIdempotent:
     ) -> Result:
         """Run `effect` at most once for `key`. See `Idempotent.run`."""
         request_hash = fingerprint(payload)
-        claim = await self.store.claim(key, request_hash, self.ttl_seconds)
+        try:
+            claim = await self.store.claim(key, request_hash, self.ttl_seconds)
+        except BaseException as exc:
+            # Same predicate as the sync engine, deliberately: "the store is
+            # unavailable" must not mean one thing here and another there.
+            if not unguarded_run_allowed(exc, self.on_store_unavailable):
+                raise
+            return Result(value=await effect(), executed=True, record=None, guarded=False)
 
         if claim.lost:
             return await self._resolve_loser(key, request_hash, claim.record)

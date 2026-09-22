@@ -28,13 +28,20 @@ from justonce import (
     Idempotent,
     InFlightTimeout,
     KeyReuseError,
+    KeyTooLongError,
     OnInFlight,
     OperationInFlightError,
     State,
+    StoreError,
     operation_key,
 )
 from justonce.keys import fingerprint
-from justonce.machine import Disposition, classify
+from justonce.machine import (
+    Disposition,
+    OnStoreUnavailable,
+    classify,
+    unguarded_run_allowed,
+)
 from justonce.stores import SqliteStore
 from justonce.stores.base import Record
 
@@ -79,6 +86,34 @@ def _record(state: State, request_hash: str = "h") -> Record:
 )
 def test_classify_table(record, request_hash, on_in_flight, expected) -> None:
     assert classify(record, request_hash, on_in_flight) is expected
+
+
+#: The other decision both engines share: may a caller whose claim raised run
+#: the effect without one? Walked as a table for the same reason `classify` is
+#: — it is pure, and a table shows the exceptions that must *not* open the gate
+#: next to the one that may.
+@pytest.mark.parametrize(
+    ("exc", "policy", "expected"),
+    [
+        (StoreError("down"), OnStoreUnavailable.FAIL_OPEN, True),
+        (StoreError("down"), OnStoreUnavailable.FAIL_CLOSED, False),
+        # Not an outage: the key is about to be truncated into a collision.
+        (KeyTooLongError("k", 8, "test"), OnStoreUnavailable.FAIL_OPEN, False),
+        (KeyReuseError("k"), OnStoreUnavailable.FAIL_OPEN, False),
+        # A bug in a store, of unknown shape. Not grounds for an unguarded run.
+        (RuntimeError("driver bug"), OnStoreUnavailable.FAIL_OPEN, False),
+        (KeyboardInterrupt(), OnStoreUnavailable.FAIL_OPEN, False),
+    ],
+    ids=["outage-open", "outage-closed", "key-too-long", "key-reuse", "bug", "interrupt"],
+)
+def test_unguarded_run_table(exc, policy, expected) -> None:
+    assert unguarded_run_allowed(exc, policy) is expected
+
+
+def test_only_one_policy_ever_runs_unguarded() -> None:
+    """Fail-open must stay the single named opt-in, whatever policies exist."""
+    opening = {p for p in OnStoreUnavailable if unguarded_run_allowed(StoreError("x"), p)}
+    assert opening == {OnStoreUnavailable.FAIL_OPEN}
 
 
 def test_every_disposition_is_reachable() -> None:
