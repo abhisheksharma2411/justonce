@@ -21,7 +21,14 @@ from typing import Any, Callable, TypeVar
 
 from .errors import InFlightTimeout
 from .keys import fingerprint
-from .machine import OnInFlight, OnStoreUnavailable, Result, settle, unguarded_run_allowed
+from .machine import (
+    OnInFlight,
+    OnStoreUnavailable,
+    Result,
+    check_windows,
+    settle,
+    unguarded_run_allowed,
+)
 from .stores.base import Record, Store
 
 T = TypeVar("T")
@@ -76,8 +83,7 @@ class Idempotent:
         retention_seconds: float = DEFAULT_RETENTION_SECONDS,
         on_store_unavailable: OnStoreUnavailable = OnStoreUnavailable.FAIL_CLOSED,
     ) -> None:
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive")
+        check_windows(ttl_seconds, retention_seconds)
         self.store = store
         self.ttl_seconds = ttl_seconds
         self.on_in_flight = on_in_flight
@@ -93,6 +99,8 @@ class Idempotent:
         *,
         payload: Any = None,
         retry_on_failure: bool = True,
+        ttl_seconds: float | None = None,
+        retention_seconds: float | None = None,
     ) -> Result:
         """Run `effect` at most once for `key`.
 
@@ -103,6 +111,18 @@ class Idempotent:
             retry_on_failure: if the effect raises, whether a later attempt may
                 retry this key. True releases the claim (transient failure);
                 False records a terminal failure so the key is burned.
+            ttl_seconds: claim lease for *this* call, overriding the engine's.
+                A charge that takes seconds and a batch job that takes an hour
+                need different leases, and one engine-wide value has to be the
+                larger of the two.
+            retention_seconds: replay window for *this* call's record.
+                Likewise: a payment must stay replayable past the dispute
+                window, and a nightly job is meaningless a day later.
+
+        `None` for either means "not given, use the engine's" — it does *not*
+        mean the store's "keep forever", which would silently make the key
+        immortal. Set indefinite retention on the engine, where the choice is
+        visible at configuration time.
 
         Raises:
             KeyReuseError: same key, different payload.
@@ -110,9 +130,18 @@ class Idempotent:
             StoreError: the store could not be reached, under the default
                 `OnStoreUnavailable.FAIL_CLOSED`.
         """
+        ttl = self.ttl_seconds if ttl_seconds is None else ttl_seconds
+        retention = (
+            self.retention_seconds if retention_seconds is None else retention_seconds
+        )
+        # Before the claim, not after: claiming and then rejecting would leave a
+        # live IN_PROGRESS row for a call that never ran, and nothing resolves it
+        # until the lease expires.
+        check_windows(ttl, retention)
+
         request_hash = fingerprint(payload)
         try:
-            claim = self.store.claim(key, request_hash, self.ttl_seconds)
+            claim = self.store.claim(key, request_hash, ttl)
         except BaseException as exc:
             if not unguarded_run_allowed(exc, self.on_store_unavailable):
                 raise
@@ -130,12 +159,12 @@ class Idempotent:
             self.store.fail(
                 key,
                 terminal=not retry_on_failure,
-                retention_seconds=self.retention_seconds,
+                retention_seconds=retention,
             )
             raise
 
         try:
-            self.store.complete(key, value, retention_seconds=self.retention_seconds)
+            self.store.complete(key, value, retention_seconds=retention)
         except BaseException:
             # The effect DID happen; we just could not record it. Leave the key
             # unresolved rather than releasing it — releasing would let a retry

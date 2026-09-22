@@ -199,3 +199,31 @@ def unguarded_run_allowed(exc: BaseException, policy: OnStoreUnavailable) -> boo
       store, and a bug of unknown shape is not grounds for an unguarded effect.
     """
     return policy is OnStoreUnavailable.FAIL_OPEN and isinstance(exc, StoreError)
+
+
+def check_windows(ttl_seconds: float, retention_seconds: float) -> None:
+    """Refuse lease and retention windows that cannot mean what they say.
+
+    Both engines call this from their constructor *and* from every `run()` that
+    takes an override, so there is one predicate rather than two that happen to
+    agree. A value rejected at startup is rejected per-call, which is the point:
+    a per-call override that skipped the check would be a second, unguarded door
+    into the state the constructor has refused since day one.
+
+    What is *not* checked is the thing that actually bites — a TTL shorter than
+    the effect's worst-case runtime. Nobody can know that runtime from here, and
+    a number that looks generous next to the happy path is not generous next to
+    a provider timing out. The lease expiring under a live holder is how one
+    effect becomes two, so pick the TTL from the timeout you enforce on the
+    effect, not from how long it usually takes.
+    """
+    if ttl_seconds <= 0:
+        raise ValueError(
+            f"ttl_seconds must be positive, got {ttl_seconds!r}; "
+            "a lease that has already expired is not a lease"
+        )
+    if retention_seconds < 0:
+        raise ValueError(
+            f"retention_seconds must not be negative, got {retention_seconds!r}; "
+            "a terminal record cannot expire before it is written"
+        )

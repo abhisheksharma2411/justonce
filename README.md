@@ -217,6 +217,44 @@ engine.sweep()   # nightly
 
 Retention is a correctness parameter, not a storage optimisation. It must outlive the longest chain that can re-deliver the same intent — including a dead-letter queue replayed a week later, and any provider dispute window. A 24-hour TTL behind a 7-day DLQ is a duplicate waiting to happen.
 
+### Per-operation leases and replay windows
+
+`ttl_seconds` and `retention_seconds` are engine-wide defaults, and a process
+that runs effects of very different shapes should not have to pick one pair for
+all of them — a card charge takes seconds and must stay replayable past the
+dispute window; a nightly batch job takes an hour and is meaningless a day
+later. One engine-wide value has to be the larger of the two, in both
+directions.
+
+Both can be overridden per call, and on the decorator:
+
+```python
+@justonce.idempotent(
+    key=lambda order: operation_key("charge", order.id),
+    ttl_seconds=60,                    # the charge times out well inside a minute
+    retention_seconds=180 * 24 * 3600, # the dispute window
+)
+def charge_customer(order): ...
+
+engine.run(key, rebuild_report, ttl_seconds=2 * 3600, retention_seconds=24 * 3600)
+```
+
+`None` — the default for both — means *not given*, so the engine's value is
+used. It does not mean the store's "keep forever"; indefinite retention is a
+decision that belongs at configuration time where it is visible.
+
+Two things worth knowing before you reach for these:
+
+* **The TTL to pick is the timeout you enforce on the effect, not how long it
+  usually takes.** The check here only refuses a lease that is already expired
+  (`ttl_seconds <= 0`). Nothing can tell from the outside that 30 seconds is
+  too short for a call that hangs for 90, and a lease expiring under a live
+  holder is how one effect becomes two.
+* **Different TTLs at different call sites for the same key are safe.** Reclaim
+  compares the `expires_at` the *holder* wrote, so a caller passing a short TTL
+  cannot decide that someone else's long lease has expired. Its own TTL only
+  sets the new expiry if it wins.
+
 ## Choosing a key
 
 The key must be **stable across retries of the same intent** and **different across distinct intents**. Nearly every idempotency bug is a key that breaks one of those:
