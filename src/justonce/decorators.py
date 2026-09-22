@@ -50,6 +50,8 @@ def idempotent(
     engine: Idempotent | None = None,
     retry_on_failure: bool = True,
     return_result: bool = False,
+    ttl_seconds: float | None = None,
+    retention_seconds: float | None = None,
 ) -> Callable[[F], F]:
     """Make a side-effecting function run at most once per derived key.
 
@@ -65,6 +67,12 @@ def idempotent(
         return_result: return the full `Result` (with `executed`) instead of
             just the value. Useful when the caller needs to know whether this
             call was the one that did the work.
+        ttl_seconds: claim lease for this operation, overriding the engine's.
+            Belongs here rather than on the engine when one process runs
+            effects of very different durations — a card charge and an hourly
+            batch job should not share a lease.
+        retention_seconds: replay window for this operation's records, likewise.
+            `None` for either inherits the engine's value; see `Idempotent.run`.
     """
 
     def decorate(func: F) -> F:
@@ -78,6 +86,8 @@ def idempotent(
                 lambda: func(*args, **kwargs),
                 payload=body,
                 retry_on_failure=retry_on_failure,
+                ttl_seconds=ttl_seconds,
+                retention_seconds=retention_seconds,
             )
             return result if return_result else result.value
 
