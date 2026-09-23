@@ -28,7 +28,14 @@ from typing import Any, Callable, Protocol, TypeVar, cast, runtime_checkable
 from .core import DEFAULT_RETENTION_SECONDS, DEFAULT_TTL_SECONDS
 from .errors import InFlightTimeout
 from .keys import fingerprint
-from .machine import OnInFlight, OnStoreUnavailable, Result, settle, unguarded_run_allowed
+from .machine import (
+    OnInFlight,
+    OnStoreUnavailable,
+    Result,
+    check_windows,
+    settle,
+    unguarded_run_allowed,
+)
 from .stores.base import Claim, Record, Store
 
 T = TypeVar("T")
@@ -132,8 +139,7 @@ class AsyncIdempotent:
         retention_seconds: float = DEFAULT_RETENTION_SECONDS,
         on_store_unavailable: OnStoreUnavailable = OnStoreUnavailable.FAIL_CLOSED,
     ) -> None:
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive")
+        check_windows(ttl_seconds, retention_seconds)
         if _is_async_store(store):
             self.store: AsyncStore = cast("AsyncStore", store)
         else:
@@ -152,11 +158,19 @@ class AsyncIdempotent:
         *,
         payload: Any = None,
         retry_on_failure: bool = True,
+        ttl_seconds: float | None = None,
+        retention_seconds: float | None = None,
     ) -> Result:
         """Run `effect` at most once for `key`. See `Idempotent.run`."""
+        ttl = self.ttl_seconds if ttl_seconds is None else ttl_seconds
+        retention = (
+            self.retention_seconds if retention_seconds is None else retention_seconds
+        )
+        check_windows(ttl, retention)
+
         request_hash = fingerprint(payload)
         try:
-            claim = await self.store.claim(key, request_hash, self.ttl_seconds)
+            claim = await self.store.claim(key, request_hash, ttl)
         except BaseException as exc:
             # Same predicate as the sync engine, deliberately: "the store is
             # unavailable" must not mean one thing here and another there.
@@ -176,12 +190,12 @@ class AsyncIdempotent:
             await self.store.fail(
                 key,
                 terminal=not retry_on_failure,
-                retention_seconds=self.retention_seconds,
+                retention_seconds=retention,
             )
             raise
 
         try:
-            await self.store.complete(key, value, retention_seconds=self.retention_seconds)
+            await self.store.complete(key, value, retention_seconds=retention)
         except BaseException:
             # The effect DID happen and we could not record it. Leave the key
             # unresolved — releasing it would let a retry apply the effect twice.
@@ -251,6 +265,8 @@ def async_idempotent(
     engine: AsyncIdempotent | None = None,
     retry_on_failure: bool = True,
     return_result: bool = False,
+    ttl_seconds: float | None = None,
+    retention_seconds: float | None = None,
 ) -> Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[Any]]]:
     """`@idempotent` for `async def` effects.
 
@@ -278,6 +294,8 @@ def async_idempotent(
                 lambda: func(*args, **kwargs),
                 payload=body,
                 retry_on_failure=retry_on_failure,
+                ttl_seconds=ttl_seconds,
+                retention_seconds=retention_seconds,
             )
             return result if return_result else result.value
 
