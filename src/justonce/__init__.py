@@ -26,6 +26,7 @@ from .core import (
     DEFAULT_TTL_SECONDS,
     Idempotent,
     OnInFlight,
+    OnStoreUnavailable,
     Result,
 )
 from .decorators import configure, get_default, idempotent
@@ -54,6 +55,7 @@ __all__ = [
     "KeyReuseError",
     "KeyTooLongError",
     "OnInFlight",
+    "OnStoreUnavailable",
     "OperationInFlightError",
     "Record",
     "Result",

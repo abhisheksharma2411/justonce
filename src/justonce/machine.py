@@ -25,7 +25,7 @@ import enum
 from dataclasses import dataclass
 from typing import Any, cast
 
-from .errors import KeyReuseError, OperationInFlightError
+from .errors import KeyReuseError, OperationInFlightError, StoreError
 from .stores.base import Record, State
 
 
@@ -39,6 +39,35 @@ class OnInFlight(str, enum.Enum):
     """Poll until the holder reaches a terminal state, bounded by `wait_timeout`."""
 
 
+class OnStoreUnavailable(str, enum.Enum):
+    """What to do when the store cannot answer "has this run?" at all.
+
+    This is not a tuning knob. It is the choice between two outages, and the
+    library refuses to make it for you because the right answer depends on what
+    the effect does, not on how the library is built.
+    """
+
+    FAIL_CLOSED = "fail_closed"
+    """No store, no claim, no effect. The default, and it stays the default.
+
+    An outage in the dedup layer becomes an outage in whatever it guards —
+    payments stop while the database is down. That is a real cost, and it is
+    the cost of the only behaviour that cannot produce a duplicate charge.
+    """
+
+    FAIL_OPEN = "fail_open"
+    """Run the effect anyway, unguarded. **Duplicates become possible.**
+
+    Not "unlikely" — possible, and concentrated exactly where it hurts. A store
+    outage is when retries are most frequent, because the callers upstream are
+    already seeing errors and retrying, and every one of those retries runs the
+    effect again with nothing in the way.
+
+    Choose this only for effects that genuinely tolerate being applied twice.
+    "The customer would probably notice and call us" is not tolerance.
+    """
+
+
 @dataclass(frozen=True)
 class Result:
     """Outcome of an idempotent execution."""
@@ -47,6 +76,14 @@ class Result:
     executed: bool
     """True if this call ran the effect; False if a previous one did."""
     record: Record | None = None
+    guarded: bool = True
+    """False when the effect ran without a claim — see `OnStoreUnavailable`.
+
+    Defaults to True because every other path in the library holds a claim.
+    Only the fail-open branch sets it False, and it does so explicitly: a
+    caller that alerts on `not result.guarded` learns it was running unguarded
+    while it was happening, rather than from the duplicate-payment report.
+    """
 
     @property
     def deduplicated(self) -> bool:
@@ -144,3 +181,21 @@ def settle(
     if disposition is Disposition.KEY_REUSE:
         raise KeyReuseError(key)
     raise OperationInFlightError(key)
+
+
+def unguarded_run_allowed(exc: BaseException, policy: OnStoreUnavailable) -> bool:
+    """May a caller whose claim raised `exc` run the effect without one?
+
+    Both engines ask this and nothing else, so "unavailable" means one thing in
+    both. Both conditions are deliberately narrow:
+
+    * The policy must be `FAIL_OPEN`. It is never inferred from the exception,
+      from a retry count, or from how long the store has been failing.
+    * The exception must be `StoreError`, which is the stores' way of saying
+      "the backend could not answer". `KeyTooLongError` also escapes `claim`
+      and is emphatically not that — it says the key is about to be truncated
+      into a collision with a different intent, so running the effect is the
+      worst available response. Anything else escaping `claim` is a bug in that
+      store, and a bug of unknown shape is not grounds for an unguarded effect.
+    """
+    return policy is OnStoreUnavailable.FAIL_OPEN and isinstance(exc, StoreError)
