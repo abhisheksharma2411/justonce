@@ -297,6 +297,36 @@ Two things worth knowing before you reach for these:
   cannot decide that someone else's long lease has expired. Its own TTL only
   sets the new expiry if it wins.
 
+### Multi-tenancy
+
+`operation_key("charge", order_id)` is global to the store. That is fine while
+order ids are globally unique and **quietly wrong** the moment they are not: two
+merchants with their own sequential numbering collide, one tenant's payment is
+deduplicated against another's, and the effect never runs. No error, no log
+line.
+
+```python
+justonce.configure(store, namespace=f"merchant:{merchant_id}")  # ✗ refused
+justonce.configure(store, namespace=f"merchant-{merchant_id}")  # ✓
+```
+
+A namespace is prefixed to every key the engine touches, and it may not contain
+`:`. That restriction is the feature, not a limitation of it — if `"a:b" + "c"`
+and `"a" + "b:c"` both produced `a:b:c`, two tenants would collide again through
+the very mechanism meant to keep them apart. Keys may contain as many colons as
+they like; only the namespace may not.
+
+Reads are scoped too. `unresolved()` and `oldest_unresolved_age()` return only
+this tenant's records, with the prefix stripped so a key can go straight back
+into `run()`. An engine with **no** namespace sees everything — that is the
+operator's view, and a reconciliation worker that could not see every unresolved
+effect would be worse than none.
+
+`sweep()` is deliberately **not** scoped: it deletes records past their
+retention window regardless of tenant, because retention is a property of the
+store and a per-tenant sweeper would leave other tenants' expired rows to
+accumulate forever.
+
 ## Choosing a key
 
 The key must be **stable across retries of the same intent** and **different across distinct intents**. Nearly every idempotency bug is a key that breaks one of those:

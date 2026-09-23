@@ -23,6 +23,7 @@ import asyncio
 import functools
 import time
 from collections.abc import Awaitable
+from dataclasses import replace
 from typing import Any, Callable, Protocol, TypeVar, cast, runtime_checkable
 
 from .core import DEFAULT_RETENTION_SECONDS, DEFAULT_TTL_SECONDS
@@ -37,6 +38,7 @@ from .machine import (
     settle,
     unguarded_run_allowed,
 )
+from .namespacing import belongs, check_namespace, scoped, unscoped
 from .stores.base import Claim, Record, Store
 
 T = TypeVar("T")
@@ -140,8 +142,10 @@ class AsyncIdempotent:
         retention_seconds: float = DEFAULT_RETENTION_SECONDS,
         on_store_unavailable: OnStoreUnavailable = OnStoreUnavailable.FAIL_CLOSED,
         hooks: Hooks | None = None,
+        namespace: str | None = None,
     ) -> None:
         check_windows(ttl_seconds, retention_seconds)
+        check_namespace(namespace)
         if _is_async_store(store):
             self.store: AsyncStore = cast("AsyncStore", store)
         else:
@@ -153,6 +157,7 @@ class AsyncIdempotent:
         self.retention_seconds = retention_seconds
         self.on_store_unavailable = on_store_unavailable
         self.hooks = hooks
+        self.namespace = namespace
 
     async def run(
         self,
@@ -172,8 +177,9 @@ class AsyncIdempotent:
         check_windows(ttl, retention)
 
         request_hash = fingerprint(payload)
+        stored = scoped(self.namespace, key)
         try:
-            claim = await self.store.claim(key, request_hash, ttl)
+            claim = await self.store.claim(stored, request_hash, ttl)
         except BaseException as exc:
             # Same predicate as the sync engine, deliberately: "the store is
             # unavailable" must not mean one thing here and another there.
@@ -184,7 +190,7 @@ class AsyncIdempotent:
 
         if claim.lost:
             emit(self.hooks, "claim_conflict", key)
-            return await self._resolve_loser(key, request_hash, claim.record)
+            return await self._resolve_loser(stored, key, request_hash, claim.record)
 
         started = time.monotonic()
         try:
@@ -194,7 +200,7 @@ class AsyncIdempotent:
             # already applied, so the caller's retry_on_failure choice governs
             # here exactly as it does for any other failure.
             await self.store.fail(
-                key,
+                stored,
                 terminal=not retry_on_failure,
                 retention_seconds=retention,
             )
@@ -202,28 +208,57 @@ class AsyncIdempotent:
             raise
 
         try:
-            await self.store.complete(key, value, retention_seconds=retention)
+            await self.store.complete(stored, value, retention_seconds=retention)
         except BaseException:
             # The effect DID happen and we could not record it. Leave the key
             # unresolved — releasing it would let a retry apply the effect twice.
-            await self.store.mark_unknown(key)
+            await self.store.mark_unknown(stored)
             emit(self.hooks, "unknown_recorded", key)
             raise
 
         emit(self.hooks, "effect_finished", key, time.monotonic() - started, True)
-        return Result(value=value, executed=True, record=await self.store.lookup(key))
+        return Result(
+            value=value,
+            executed=True,
+            record=self._strip(await self.store.lookup(stored)),
+        )
 
     async def sweep(self, *, now: float | None = None) -> int:
         """See `Idempotent.sweep`. `now=None` defers to the store's clock."""
         return await self.store.sweep(before=now)
 
     async def unresolved(self, *, limit: int = 100) -> list[Record]:
-        return await self.store.unresolved(limit=limit)
+        """See `Idempotent.unresolved` — scoped, stripped, and paged forward."""
+        if self.namespace is None:
+            return await self.store.unresolved(limit=limit)
+
+        found: list[Record] = []
+        page = max(limit * 4, 100)
+        seen = 0
+        while len(found) < limit:
+            batch = (await self.store.unresolved(limit=seen + page))[seen:]
+            if not batch:
+                break
+            seen += len(batch)
+            found.extend(
+                self._rekey(r) for r in batch if belongs(self.namespace, r.key)
+            )
+        return found[:limit]
 
     # -- internals ----------------------------------------------------------
 
+    def _strip(self, record: Record | None) -> Record | None:
+        """See `Idempotent._strip` — records go back in the caller's keyspace."""
+        return record if record is None else self._rekey(record)
+
+    def _rekey(self, record: Record) -> Record:
+        """The same record, with the namespace prefix taken back off its key."""
+        if self.namespace is None:
+            return record
+        return replace(record, key=unscoped(self.namespace, record.key))
+
     async def _resolve_loser(
-        self, key: str, request_hash: str, record: Record | None
+        self, stored: str, key: str, request_hash: str, record: Record | None
     ) -> Result:
         try:
             settled = settle(key, record, request_hash, self.on_in_flight)
@@ -232,10 +267,10 @@ class AsyncIdempotent:
             raise
         if settled is not None:
             emit(self.hooks, "duplicate_suppressed", key, settled.record)
-            return settled
-        return await self._wait_for(key, request_hash)
+            return replace(settled, record=self._strip(settled.record))
+        return await self._wait_for(stored, key, request_hash)
 
-    async def _wait_for(self, key: str, request_hash: str) -> Result:
+    async def _wait_for(self, stored: str, key: str, request_hash: str) -> Result:
         deadline = time.monotonic() + self.wait_timeout
         while time.monotonic() < deadline:
             # asyncio.sleep, never time.sleep: blocking here would stall every
@@ -244,14 +279,14 @@ class AsyncIdempotent:
             await asyncio.sleep(self.poll_interval)
             try:
                 settled = settle(
-                    key, await self.store.lookup(key), request_hash, OnInFlight.WAIT
+                    key, await self.store.lookup(stored), request_hash, OnInFlight.WAIT
                 )
             except KeyReuseError:
                 emit(self.hooks, "key_reuse", key)
                 raise
             if settled is not None:
                 emit(self.hooks, "duplicate_suppressed", key, settled.record)
-                return settled
+                return replace(settled, record=self._strip(settled.record))
         raise InFlightTimeout(key, self.wait_timeout)
 
 
