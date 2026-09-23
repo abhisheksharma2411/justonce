@@ -19,7 +19,8 @@ from __future__ import annotations
 import time
 from typing import Any, Callable, TypeVar
 
-from .errors import InFlightTimeout
+from .errors import InFlightTimeout, KeyReuseError
+from .hooks import Hooks, emit
 from .keys import fingerprint
 from .machine import (
     OnInFlight,
@@ -51,6 +52,7 @@ DEFAULT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 __all__ = [
     "DEFAULT_RETENTION_SECONDS",
     "DEFAULT_TTL_SECONDS",
+    "Hooks",
     "Idempotent",
     "OnInFlight",
     "OnStoreUnavailable",
@@ -70,6 +72,8 @@ class Idempotent:
         on_store_unavailable: behaviour when the store cannot be reached at
             all. Fail-closed by default, and changing it is a decision about
             duplicate effects — read `OnStoreUnavailable` before you do.
+        hooks: observability callbacks. See `justonce.hooks.Hooks`; a hook
+            that raises is swallowed and cannot change an outcome.
     """
 
     def __init__(
@@ -82,9 +86,11 @@ class Idempotent:
         poll_interval: float = 0.05,
         retention_seconds: float = DEFAULT_RETENTION_SECONDS,
         on_store_unavailable: OnStoreUnavailable = OnStoreUnavailable.FAIL_CLOSED,
+        hooks: Hooks | None = None,
     ) -> None:
         check_windows(ttl_seconds, retention_seconds)
         self.store = store
+        self.hooks = hooks
         self.ttl_seconds = ttl_seconds
         self.on_in_flight = on_in_flight
         self.wait_timeout = wait_timeout
@@ -145,11 +151,14 @@ class Idempotent:
         except BaseException as exc:
             if not unguarded_run_allowed(exc, self.on_store_unavailable):
                 raise
+            emit(self.hooks, "ran_unguarded", key)
             return self._run_unguarded(effect)
 
         if claim.lost:
+            emit(self.hooks, "claim_conflict", key)
             return self._resolve_loser(key, request_hash, claim.record)
 
+        started = time.monotonic()
         try:
             value = effect()
         except BaseException:
@@ -161,6 +170,9 @@ class Idempotent:
                 terminal=not retry_on_failure,
                 retention_seconds=retention,
             )
+            # After the outcome write, so the metric never claims an outcome the
+            # ledger does not have.
+            emit(self.hooks, "effect_finished", key, time.monotonic() - started, False)
             raise
 
         try:
@@ -170,8 +182,10 @@ class Idempotent:
             # unresolved rather than releasing it — releasing would let a retry
             # apply the effect a second time.
             self.store.mark_unknown(key)
+            emit(self.hooks, "unknown_recorded", key)
             raise
 
+        emit(self.hooks, "effect_finished", key, time.monotonic() - started, True)
         return Result(value=value, executed=True, record=self.store.lookup(key))
 
     def sweep(self, *, now: float | None = None) -> int:
@@ -183,6 +197,26 @@ class Idempotent:
         next delivery of the same request cannot find.
         """
         return self.store.sweep(before=now)
+
+    def oldest_unresolved_age(self) -> float | None:
+        """Seconds since the oldest unresolved outcome was written, or `None`.
+
+        The issue calls this the one to alert on, and it is right: a stuck
+        reconciliation is invisible in a *count* that stays flat, because the
+        count only moves when something new breaks. Age moves every second.
+
+        Measured against the **store's** clock, for the same reason leases are
+        (#47): computed against a caller whose clock runs fast, this gauge
+        reports an age that never happened — and it is the number a pager is
+        attached to.
+        """
+        oldest = self.store.unresolved(limit=1)
+        if not oldest:
+            return None
+        written = oldest[0].updated_at or oldest[0].created_at
+        if written is None:
+            return None
+        return max(0.0, self.store.now() - written)
 
     def unresolved(self, *, limit: int = 100) -> list[Record]:
         """Effects whose outcome was never observed — reconciliation's input."""
@@ -206,8 +240,13 @@ class Idempotent:
         return Result(value=effect(), executed=True, record=None, guarded=False)
 
     def _resolve_loser(self, key: str, request_hash: str, record: Record | None) -> Result:
-        settled = settle(key, record, request_hash, self.on_in_flight)
+        try:
+            settled = settle(key, record, request_hash, self.on_in_flight)
+        except KeyReuseError:
+            emit(self.hooks, "key_reuse", key)
+            raise
         if settled is not None:
+            emit(self.hooks, "duplicate_suppressed", key, settled.record)
             return settled
         return self._wait_for(key, request_hash)
 
@@ -218,7 +257,12 @@ class Idempotent:
             # OnInFlight.WAIT, not self.on_in_flight: reaching here already
             # means waiting was chosen, and a still-in-progress holder must keep
             # us polling rather than raise.
-            settled = settle(key, self.store.lookup(key), request_hash, OnInFlight.WAIT)
+            try:
+                settled = settle(key, self.store.lookup(key), request_hash, OnInFlight.WAIT)
+            except KeyReuseError:
+                emit(self.hooks, "key_reuse", key)
+                raise
             if settled is not None:
+                emit(self.hooks, "duplicate_suppressed", key, settled.record)
                 return settled
         raise InFlightTimeout(key, self.wait_timeout)

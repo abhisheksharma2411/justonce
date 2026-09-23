@@ -196,6 +196,48 @@ cannot find, so the effect runs again.
 no clock but the caller's, which is harmless only because no second process can
 reach it to disagree.
 
+### Metrics, and the one to alert on
+
+The library knows things you need and otherwise keeps them to itself. Subclass
+`Hooks`, override what you care about, and wire it to whatever you already use —
+there is no metrics dependency here, because a correctness library that drags in
+a metrics client is one people vendor around.
+
+```python
+class Metrics(justonce.Hooks):
+    def duplicate_suppressed(self, key, record):  # what the library is worth
+        DUPES.inc()
+    def ran_unguarded(self, key):                 # idempotency was OFF
+        UNGUARDED.inc()
+    def unknown_recorded(self, key):              # reconciliation queue grew
+        UNKNOWN.inc()
+    def effect_finished(self, key, duration_seconds, ok):
+        DURATION.observe(duration_seconds)
+
+justonce.configure(store, hooks=Metrics())
+```
+
+`claim_conflict` and `key_reuse` are there too. `key_reuse` is never routine: it
+means two distinct intents derived one key, so one of them is about to be
+treated as a replay of the other and never applied.
+
+**A hook cannot change an outcome.** Every callback is invoked defensively, so a
+metrics backend being down cannot fail a payment. The consequence is worth
+stating plainly: an exception inside a hook is *lost*. If you need to know your
+metrics are broken, the hook body has to be what reports it.
+
+**Alert on the age, not the count:**
+
+```python
+age = engine.oldest_unresolved_age()   # seconds, or None when nothing is unresolved
+```
+
+A stuck reconciliation is invisible in a count that stays flat — the count only
+moves when something new breaks. Age moves every second. It is measured on the
+store's clock for the same reason leases are: computed against a host whose
+clock runs fast, this gauge reports an age that never happened, and it is the
+number the pager is attached to.
+
 ### Reconciliation
 
 Prevention is never complete. When a process dies *between* the effect and recording it, the key is left `UNKNOWN` rather than cleaned up — because "we don't know whether the customer was charged" is a fact worth keeping.
