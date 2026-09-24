@@ -17,6 +17,7 @@ was charged" is a fact worth keeping.
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Any, Callable, TypeVar
 
 from .errors import InFlightTimeout, KeyReuseError
@@ -30,6 +31,7 @@ from .machine import (
     settle,
     unguarded_run_allowed,
 )
+from .namespacing import belongs, check_namespace, scoped, unscoped
 from .stores.base import Record, Store
 
 T = TypeVar("T")
@@ -74,6 +76,9 @@ class Idempotent:
             duplicate effects — read `OnStoreUnavailable` before you do.
         hooks: observability callbacks. See `justonce.hooks.Hooks`; a hook
             that raises is swallowed and cannot change an outcome.
+        namespace: prefixed to every key, so tenants with their own id
+            sequences cannot collide. `None` (the default) is the existing
+            global keyspace. See `justonce.namespacing`.
     """
 
     def __init__(
@@ -87,10 +92,13 @@ class Idempotent:
         retention_seconds: float = DEFAULT_RETENTION_SECONDS,
         on_store_unavailable: OnStoreUnavailable = OnStoreUnavailable.FAIL_CLOSED,
         hooks: Hooks | None = None,
+        namespace: str | None = None,
     ) -> None:
         check_windows(ttl_seconds, retention_seconds)
+        check_namespace(namespace)
         self.store = store
         self.hooks = hooks
+        self.namespace = namespace
         self.ttl_seconds = ttl_seconds
         self.on_in_flight = on_in_flight
         self.wait_timeout = wait_timeout
@@ -146,8 +154,9 @@ class Idempotent:
         check_windows(ttl, retention)
 
         request_hash = fingerprint(payload)
+        stored = scoped(self.namespace, key)
         try:
-            claim = self.store.claim(key, request_hash, ttl)
+            claim = self.store.claim(stored, request_hash, ttl)
         except BaseException as exc:
             if not unguarded_run_allowed(exc, self.on_store_unavailable):
                 raise
@@ -156,7 +165,7 @@ class Idempotent:
 
         if claim.lost:
             emit(self.hooks, "claim_conflict", key)
-            return self._resolve_loser(key, request_hash, claim.record)
+            return self._resolve_loser(stored, key, request_hash, claim.record)
 
         started = time.monotonic()
         try:
@@ -166,7 +175,7 @@ class Idempotent:
             # which risk the caller prefers: a possible duplicate on retry, or
             # a possible lost effect. Never guess on their behalf.
             self.store.fail(
-                key,
+                stored,
                 terminal=not retry_on_failure,
                 retention_seconds=retention,
             )
@@ -176,17 +185,17 @@ class Idempotent:
             raise
 
         try:
-            self.store.complete(key, value, retention_seconds=retention)
+            self.store.complete(stored, value, retention_seconds=retention)
         except BaseException:
             # The effect DID happen; we just could not record it. Leave the key
             # unresolved rather than releasing it — releasing would let a retry
             # apply the effect a second time.
-            self.store.mark_unknown(key)
+            self.store.mark_unknown(stored)
             emit(self.hooks, "unknown_recorded", key)
             raise
 
         emit(self.hooks, "effect_finished", key, time.monotonic() - started, True)
-        return Result(value=value, executed=True, record=self.store.lookup(key))
+        return Result(value=value, executed=True, record=self._strip(self.store.lookup(stored)))
 
     def sweep(self, *, now: float | None = None) -> int:
         """Delete terminal records past their retention window.
@@ -210,7 +219,9 @@ class Idempotent:
         reports an age that never happened — and it is the number a pager is
         attached to.
         """
-        oldest = self.store.unresolved(limit=1)
+        # Through the scoped reader, not the store directly: a per-tenant
+        # engine must not page an operator on another tenant's backlog.
+        oldest = self.unresolved(limit=1)
         if not oldest:
             return None
         written = oldest[0].updated_at or oldest[0].created_at
@@ -219,8 +230,34 @@ class Idempotent:
         return max(0.0, self.store.now() - written)
 
     def unresolved(self, *, limit: int = 100) -> list[Record]:
-        """Effects whose outcome was never observed — reconciliation's input."""
-        return self.store.unresolved(limit=limit)
+        """Effects whose outcome was never observed — reconciliation's input.
+
+        Scoped to this engine's namespace, because the alternative hands one
+        tenant another's list of "we do not know whether this customer was
+        charged". An engine with no namespace sees everything, which is the
+        operator's view rather than a tenant's.
+
+        The paging matters. Fetching `limit` rows and filtering them is the
+        obvious implementation and it under-reports: a noisy neighbour fills the
+        first page and a scoped caller is told its queue is empty while its own
+        records sit on page two. So it reads forward until it has `limit` of its
+        own or the store is exhausted.
+        """
+        if self.namespace is None:
+            return self.store.unresolved(limit=limit)
+
+        found: list[Record] = []
+        page = max(limit * 4, 100)
+        seen = 0
+        while len(found) < limit:
+            batch = self.store.unresolved(limit=seen + page)[seen:]
+            if not batch:
+                break
+            seen += len(batch)
+            found.extend(
+                self._rekey(r) for r in batch if belongs(self.namespace, r.key)
+            )
+        return found[:limit]
 
     # -- internals ----------------------------------------------------------
 
@@ -239,18 +276,38 @@ class Idempotent:
         """
         return Result(value=effect(), executed=True, record=None, guarded=False)
 
-    def _resolve_loser(self, key: str, request_hash: str, record: Record | None) -> Result:
+    def _strip(self, record: Record | None) -> Record | None:
+        """Hand a record back in the caller's keyspace, not the store's.
+
+        Leaving the prefix on would mean a key read from `unresolved()` could
+        not be passed straight back to `run()` — the caller would have to strip
+        something the engine added, which is the kind of asymmetry that gets
+        rediscovered during an incident.
+        """
+        return record if record is None else self._rekey(record)
+
+    def _rekey(self, record: Record) -> Record:
+        """The same record, with the namespace prefix taken back off its key."""
+        if self.namespace is None:
+            return record
+        return replace(record, key=unscoped(self.namespace, record.key))
+
+    def _resolve_loser(
+        self, stored: str, key: str, request_hash: str, record: Record | None
+    ) -> Result:
         try:
+            # `key`, not `stored`: the error a caller catches names the key they
+            # passed, not the one the engine derived from it.
             settled = settle(key, record, request_hash, self.on_in_flight)
         except KeyReuseError:
             emit(self.hooks, "key_reuse", key)
             raise
         if settled is not None:
             emit(self.hooks, "duplicate_suppressed", key, settled.record)
-            return settled
-        return self._wait_for(key, request_hash)
+            return replace(settled, record=self._strip(settled.record))
+        return self._wait_for(stored, key, request_hash)
 
-    def _wait_for(self, key: str, request_hash: str) -> Result:
+    def _wait_for(self, stored: str, key: str, request_hash: str) -> Result:
         deadline = time.monotonic() + self.wait_timeout
         while time.monotonic() < deadline:
             time.sleep(self.poll_interval)
@@ -258,11 +315,13 @@ class Idempotent:
             # means waiting was chosen, and a still-in-progress holder must keep
             # us polling rather than raise.
             try:
-                settled = settle(key, self.store.lookup(key), request_hash, OnInFlight.WAIT)
+                settled = settle(
+                    key, self.store.lookup(stored), request_hash, OnInFlight.WAIT
+                )
             except KeyReuseError:
                 emit(self.hooks, "key_reuse", key)
                 raise
             if settled is not None:
                 emit(self.hooks, "duplicate_suppressed", key, settled.record)
-                return settled
+                return replace(settled, record=self._strip(settled.record))
         raise InFlightTimeout(key, self.wait_timeout)
