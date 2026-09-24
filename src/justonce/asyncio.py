@@ -26,7 +26,8 @@ from collections.abc import Awaitable
 from typing import Any, Callable, Protocol, TypeVar, cast, runtime_checkable
 
 from .core import DEFAULT_RETENTION_SECONDS, DEFAULT_TTL_SECONDS
-from .errors import InFlightTimeout
+from .errors import InFlightTimeout, KeyReuseError
+from .hooks import Hooks, emit
 from .keys import fingerprint
 from .machine import (
     OnInFlight,
@@ -138,6 +139,7 @@ class AsyncIdempotent:
         poll_interval: float = 0.05,
         retention_seconds: float = DEFAULT_RETENTION_SECONDS,
         on_store_unavailable: OnStoreUnavailable = OnStoreUnavailable.FAIL_CLOSED,
+        hooks: Hooks | None = None,
     ) -> None:
         check_windows(ttl_seconds, retention_seconds)
         if _is_async_store(store):
@@ -150,6 +152,7 @@ class AsyncIdempotent:
         self.poll_interval = poll_interval
         self.retention_seconds = retention_seconds
         self.on_store_unavailable = on_store_unavailable
+        self.hooks = hooks
 
     async def run(
         self,
@@ -176,11 +179,14 @@ class AsyncIdempotent:
             # unavailable" must not mean one thing here and another there.
             if not unguarded_run_allowed(exc, self.on_store_unavailable):
                 raise
+            emit(self.hooks, "ran_unguarded", key)
             return Result(value=await effect(), executed=True, record=None, guarded=False)
 
         if claim.lost:
+            emit(self.hooks, "claim_conflict", key)
             return await self._resolve_loser(key, request_hash, claim.record)
 
+        started = time.monotonic()
         try:
             value = await effect()
         except BaseException:
@@ -192,6 +198,7 @@ class AsyncIdempotent:
                 terminal=not retry_on_failure,
                 retention_seconds=retention,
             )
+            emit(self.hooks, "effect_finished", key, time.monotonic() - started, False)
             raise
 
         try:
@@ -200,8 +207,10 @@ class AsyncIdempotent:
             # The effect DID happen and we could not record it. Leave the key
             # unresolved — releasing it would let a retry apply the effect twice.
             await self.store.mark_unknown(key)
+            emit(self.hooks, "unknown_recorded", key)
             raise
 
+        emit(self.hooks, "effect_finished", key, time.monotonic() - started, True)
         return Result(value=value, executed=True, record=await self.store.lookup(key))
 
     async def sweep(self, *, now: float | None = None) -> int:
@@ -216,8 +225,13 @@ class AsyncIdempotent:
     async def _resolve_loser(
         self, key: str, request_hash: str, record: Record | None
     ) -> Result:
-        settled = settle(key, record, request_hash, self.on_in_flight)
+        try:
+            settled = settle(key, record, request_hash, self.on_in_flight)
+        except KeyReuseError:
+            emit(self.hooks, "key_reuse", key)
+            raise
         if settled is not None:
+            emit(self.hooks, "duplicate_suppressed", key, settled.record)
             return settled
         return await self._wait_for(key, request_hash)
 
@@ -228,8 +242,15 @@ class AsyncIdempotent:
             # other request sharing this event loop. This is the only line in
             # the whole decision path that differs from the sync engine.
             await asyncio.sleep(self.poll_interval)
-            settled = settle(key, await self.store.lookup(key), request_hash, OnInFlight.WAIT)
+            try:
+                settled = settle(
+                    key, await self.store.lookup(key), request_hash, OnInFlight.WAIT
+                )
+            except KeyReuseError:
+                emit(self.hooks, "key_reuse", key)
+                raise
             if settled is not None:
+                emit(self.hooks, "duplicate_suppressed", key, settled.record)
                 return settled
         raise InFlightTimeout(key, self.wait_timeout)
 

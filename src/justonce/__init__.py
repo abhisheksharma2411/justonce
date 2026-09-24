@@ -38,6 +38,7 @@ from .errors import (
     OperationInFlightError,
     StoreError,
 )
+from .hooks import Hooks
 from .keys import fingerprint, operation_key
 from .stores.base import Claim, Record, State, Store
 
@@ -49,6 +50,7 @@ __all__ = [
     "AsyncIdempotent",
     "AsyncStore",
     "Claim",
+    "Hooks",
     "Idempotent",
     "InFlightTimeout",
     "JustOnceError",
