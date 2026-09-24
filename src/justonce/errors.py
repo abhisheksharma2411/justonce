@@ -84,6 +84,34 @@ class KeyTooLongError(JustOnceError):
         self.backend = backend
 
 
+class AmbientTransactionError(JustOnceError):
+    """A store declaring `external_effects=True` was asked to claim inside the
+    caller's transaction.
+
+    The claim would roll back with that block while the external effect it
+    guards — a charge, an email, a webhook — stands. The retry then finds no
+    claim and does it again.
+
+    Raised rather than warned for what the failure costs: a warning on stderr
+    during an incident is not a control, and refusing to claim is. Raised
+    before any write, so a refusal leaves nothing behind.
+
+    Only reachable when the caller opted in, because the library cannot tell a
+    local write (where sharing the transaction is correct) from an external
+    call (where it is not). See issue #44.
+    """
+
+    def __init__(self, key: str, using: str) -> None:
+        super().__init__(
+            f"refusing to claim {key!r}: this store declares external_effects=True and is "
+            f"inside the caller's transaction on alias {using!r}, so the claim would roll "
+            "back while the effect it guards does not. Put the store on its own database "
+            "alias, or claim outside the atomic() block."
+        )
+        self.key = key
+        self.using = using
+
+
 class ResponseDecodeError(JustOnceError):
     """A stored response could not be decoded back into the recorded value.
 

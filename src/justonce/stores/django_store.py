@@ -35,7 +35,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from ..errors import StoreError
+from ..errors import AmbientTransactionError, StoreError
 from .base import Claim, Record, State, check_key_length, decode_response
 
 try:  # pragma: no cover - import guard
@@ -180,9 +180,15 @@ class DjangoStore:
         *,
         create_table: bool = False,
         max_key_length: int | Literal["auto"] | None = "auto",
+        external_effects: bool = False,
     ) -> None:
         self.using = using or "default"
         self._max_key_length = max_key_length
+        # #44: the caller asserting "the effect this store guards is not in this
+        # transaction". Only they can make that claim — `claim()` cannot tell a
+        # local write from an external call — but once made, it is exact rather
+        # than heuristic, so it can be enforced with no false positives.
+        self.external_effects = external_effects
         if create_table:
             self.create_table()
 
@@ -263,6 +269,9 @@ class DjangoStore:
         # Before the try: a key this store cannot hold is the caller's bug, not
         # a store failure, and must not be reported as `StoreError`.
         check_key_length(key, self.max_key_length, self.vendor)
+        # Also before any write, so a refused claim leaves nothing behind.
+        if self.external_effects and self.in_ambient_transaction():
+            raise AmbientTransactionError(key, self.using)
         now_sql = _NOW[self.vendor]
         try:
             with self._conn.cursor() as cur:
