@@ -21,6 +21,7 @@ from .asyncio import (
     async_idempotent,
     configure_async,
 )
+from .codecs import JsonResponseCodec, ResponseCodec
 from .core import (
     DEFAULT_RETENTION_SECONDS,
     DEFAULT_TTL_SECONDS,
@@ -36,6 +37,7 @@ from .errors import (
     KeyReuseError,
     KeyTooLongError,
     OperationInFlightError,
+    ResponseDecodeError,
     StoreError,
 )
 from .hooks import Hooks
@@ -53,6 +55,7 @@ __all__ = [
     "Hooks",
     "Idempotent",
     "InFlightTimeout",
+    "JsonResponseCodec",
     "JustOnceError",
     "KeyReuseError",
     "KeyTooLongError",
@@ -60,6 +63,8 @@ __all__ = [
     "OnStoreUnavailable",
     "OperationInFlightError",
     "Record",
+    "ResponseCodec",
+    "ResponseDecodeError",
     "Result",
     "State",
     "Store",

@@ -84,6 +84,15 @@ class Result:
     caller that alerts on `not result.guarded` learns it was running unguarded
     while it was happening, rather than from the duplicate-payment report.
     """
+    response_available: bool = True
+    """False when `value` is not the effect's actual response (#48).
+
+    Only `store_response=False` produces it, and only on a replay: the call
+    that ran the effect has the live value in hand regardless. `value is None`
+    on its own cannot carry this, because an effect may genuinely return
+    `None` — and reading a real prior charge as "no body" is the one wrong
+    answer that looks like a right one.
+    """
 
     @property
     def deduplicated(self) -> bool:
@@ -145,17 +154,23 @@ def classify(
     return Disposition.IN_FLIGHT
 
 
-def replay(record: Record) -> Result:
+def replay(record: Record, response_available: bool) -> Result:
     """Build the result a losing caller sees for a terminal record.
 
     A failed record replays as `None` rather than re-raising: the exception
     belonged to the attempt that failed, and this caller did not make it.
     `record.state` is there for anyone who needs to tell the two apart.
+
+    `response_available=False` is how `store_response=False` says "this `None`
+    is an absence, not an answer". Required rather than defaulted: `settle` is
+    the only caller and always knows, and a default here would be an untested
+    branch that quietly claims a body is available.
     """
     return Result(
         value=record.response if record.state is State.SUCCEEDED else None,
         executed=False,
         record=record,
+        response_available=response_available,
     )
 
 
@@ -164,6 +179,7 @@ def settle(
     record: Record | None,
     request_hash: str,
     on_in_flight: OnInFlight,
+    response_available: bool = True,
 ) -> Result | None:
     """Classify and act: return a `Result`, return `None` to wait, or raise.
 
@@ -175,7 +191,7 @@ def settle(
 
     if disposition is Disposition.REPLAY:
         # classify returns REPLAY only for a non-None terminal record.
-        return replay(cast("Record", record))
+        return replay(cast("Record", record), response_available)
     if disposition is Disposition.WAIT:
         return None
     if disposition is Disposition.KEY_REUSE:

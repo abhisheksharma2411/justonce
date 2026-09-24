@@ -250,6 +250,55 @@ for record in engine.unresolved():
 
 Alert on the **age** of the oldest unresolved record, not the count. A stuck reconciliation is invisible in a count that stays flat.
 
+### What gets stored, and how to encrypt it
+
+**Say this part out loud, because the library used to not.** `complete()` stores
+whatever your effect returned. For the case this library is built for, that is a
+payment provider's reply — last four digits, cardholder name, billing address,
+email — and it sits in your database in plaintext for the whole retention window,
+which the section below correctly tells you to make long.
+
+That is a decision, so make it one:
+
+```python
+class Encrypted(justonce.ResponseCodec):
+    def encode(self, value):            # on the way into the store
+        return {"v": 1, "ct": kms.encrypt(json.dumps(value))}
+    def decode(self, stored):           # on the way back out
+        return json.loads(kms.decrypt(stored["ct"]))
+
+justonce.configure(store, codec=Encrypted())
+```
+
+The codec sits on the **engine**, so every store gets it — including one you
+wrote yourself. It is also the answer to a value JSON cannot carry (a `Decimal`,
+a `datetime`, a dataclass): convert on the way in, convert back on the way out.
+The rule is `decode(encode(x)) == x` for everything your effect can return; a
+codec that is lossy either way silently changes what a replay hands a caller.
+
+Or store no body at all:
+
+```python
+justonce.configure(store, store_response=False)
+```
+
+Dedup is unchanged — the effect still runs exactly once — but a replay is told
+only *that* it already ran:
+
+```python
+result = charge(order)
+if result.deduplicated and not result.response_available:
+    ...  # already charged; we did not keep the provider's reply
+```
+
+`value is None` cannot carry that on its own, because an effect may genuinely
+return `None`, and reading a real prior charge as "no body" is the one wrong
+answer that looks like a right one.
+
+**A codec that cannot read its own row raises** `ResponseDecodeError` rather
+than replaying `None` — a rotated key means "we cannot tell you what the
+provider said", and that is not the same as "there was nothing".
+
 ### Retention
 
 ```python
