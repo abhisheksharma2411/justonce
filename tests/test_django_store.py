@@ -52,8 +52,8 @@ from justonce.conformance import StoreConformanceTests  # noqa: E402
 from justonce.stores.django_store import TABLE, DjangoStore  # noqa: E402
 
 
-def _fresh(using: str = "default") -> DjangoStore:
-    store = DjangoStore(using=using)
+def _fresh(using: str = "default", **kwargs: object) -> DjangoStore:
+    store = DjangoStore(using=using, **kwargs)  # type: ignore[arg-type]
     store.create_table()
     with connections[using].cursor() as cur:
         cur.execute(f"DELETE FROM {TABLE}")
@@ -106,6 +106,59 @@ class TestDjangoSpecifics:
         # The claim is gone: a retry would run the effect again.
         assert store.lookup(key) is None
         assert store.claim(key, "hash", 60).won is True
+
+    def test_external_effects_refuses_a_claim_inside_an_ambient_transaction(self) -> None:
+        """#44: the opt-in guard. The caller states that the effect this store
+        guards is not in this transaction; the library then checks it.
+
+        Raising rather than warning is the whole point. If the assertion is
+        wrong the claim rolls back while an external charge stands, and the
+        retry charges again — a warning on stderr during an incident is not a
+        control, refusing to claim is.
+        """
+        from justonce.errors import AmbientTransactionError
+
+        store = _fresh(external_effects=True)
+        key = operation_key("charge", "order_ext_1")
+
+        with transaction.atomic():
+            with pytest.raises(AmbientTransactionError) as caught:
+                store.claim(key, "hash", 60)
+            assert "external_effects" in str(caught.value)
+
+    def test_the_refused_claim_leaves_nothing_behind(self) -> None:
+        """The raise goes before any write, so a refusal is not a half-claim."""
+        from justonce.errors import AmbientTransactionError
+
+        store = _fresh(external_effects=True)
+        key = operation_key("charge", "order_ext_2")
+
+        with transaction.atomic(), pytest.raises(AmbientTransactionError):
+            store.claim(key, "hash", 60)
+
+        assert store.lookup(key) is None
+        assert store.claim(key, "hash", 60).won is True
+
+    def test_external_effects_is_silent_outside_a_transaction(self) -> None:
+        store = _fresh(external_effects=True)
+        key = operation_key("charge", "order_ext_3")
+        assert store.claim(key, "hash", 60).won is True
+
+    def test_the_default_is_untouched(self) -> None:
+        """Every existing deployment keeps working. This is the first test for
+        a guard like this, because an opt-in that is not opt-in is a breakage."""
+        store = _fresh()
+        key = operation_key("charge", "order_ext_4")
+        with transaction.atomic():
+            assert store.claim(key, "hash", 60).won is True
+
+    def test_a_separate_alias_is_not_an_ambient_transaction(self) -> None:
+        """The configuration the guard is meant to encourage must pass it: the
+        store is on its own alias, so the caller's block cannot roll it back."""
+        store = _fresh("effects", external_effects=True)
+        key = operation_key("charge", "order_ext_5")
+        with transaction.atomic(using="default"):
+            assert store.claim(key, "hash", 60).won is True
 
     def test_a_separate_alias_survives_the_callers_rollback(self) -> None:
         """The configuration to use when the effect is an external call."""

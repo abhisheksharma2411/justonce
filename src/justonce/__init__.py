@@ -32,6 +32,7 @@ from .core import (
 )
 from .decorators import configure, get_default, idempotent
 from .errors import (
+    AmbientTransactionError,
     InFlightTimeout,
     JustOnceError,
     KeyReuseError,
@@ -49,6 +50,7 @@ __version__ = "0.2.0"
 __all__ = [
     "DEFAULT_RETENTION_SECONDS",
     "DEFAULT_TTL_SECONDS",
+    "AmbientTransactionError",
     "AsyncIdempotent",
     "AsyncStore",
     "Claim",

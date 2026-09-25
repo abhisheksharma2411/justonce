@@ -346,6 +346,31 @@ Two things worth knowing before you reach for these:
   cannot decide that someone else's long lease has expired. Its own TTL only
   sets the new expiry if it wins.
 
+### Django: the transaction trap
+
+A `DjangoStore` on the default alias joins the caller's `transaction.atomic()`
+block. If the effect is an **external** call, that is the bug this library
+exists to prevent, arriving through the back door: the rollback erases the
+claim, the charge stands, and the retry charges again.
+
+The library cannot detect this for you — from inside `claim()` a local write
+(where sharing the transaction is *correct*) and an external call are the same
+thing. So you say which you have, and then it can check:
+
+```python
+DjangoStore(using="effects", external_effects=True)
+```
+
+With `external_effects=True`, a claim attempted inside an ambient transaction
+raises `AmbientTransactionError` **before writing anything**. Default is `False`,
+so existing configurations are untouched.
+
+It raises rather than warns because of what the failure costs. A warning on
+stderr during an incident is not a control; refusing to claim is.
+
+The fix it is pointing you at is a separate database alias, which is outside the
+caller's transaction and therefore survives the rollback.
+
 ### Multi-tenancy
 
 `operation_key("charge", order_id)` is global to the store. That is fine while
