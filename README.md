@@ -308,6 +308,32 @@ engine.sweep()   # nightly
 
 Retention is a correctness parameter, not a storage optimisation. It must outlive the longest chain that can re-deliver the same intent — including a dead-letter queue replayed a week later, and any provider dispute window. A 24-hour TTL behind a 7-day DLQ is a duplicate waiting to happen.
 
+`sweep()` exists but nothing calls it for you, so in practice the table grows
+until somebody notices. Installing the package provides a `justonce` command for
+exactly that:
+
+```sh
+justonce sweep --engine myapp.idempotency:engine
+# swept 412 record(s); oldest unresolved: 37s
+```
+
+`--engine` names the engine the way gunicorn names an app,
+`package.module:attribute`. It has to be *your* engine rather than flags
+describing a store, so the sweeper cannot drift from the store the application
+is actually writing to.
+
+As a cron entry:
+
+```cron
+17 3 * * *  cd /srv/app && /srv/app/.venv/bin/justonce sweep --engine myapp.idempotency:engine
+```
+
+The unresolved age is printed beside the count deliberately. `sweep` never
+deletes `IN_PROGRESS` or `UNKNOWN` records — an unresolved outcome that gets
+swept is a duplicate charge nobody can trace — so a healthy-looking removal
+count can sit in front of a backlog that is never going down. The age is the
+number to alert on.
+
 ### Per-operation leases and replay windows
 
 `ttl_seconds` and `retention_seconds` are engine-wide defaults, and a process

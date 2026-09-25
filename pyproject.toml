@@ -27,6 +27,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.scripts]
+justonce = "justonce.cli:main"
+
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.1"]
 django = ["django>=4.2"]
