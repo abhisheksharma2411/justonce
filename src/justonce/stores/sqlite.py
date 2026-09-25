@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,74 @@ class SqliteStore:
         with self._lock:
             value: float = self._conn.execute(f"SELECT {_NOW}").fetchone()[0]
         return value
+
+    #: `INSERT ... RETURNING` landed in SQLite 3.35. Python 3.9 can be linked
+    #: against older, so the batch path is a capability, not an assumption.
+    _RETURNING_MIN = (3, 35, 0)
+
+    @staticmethod
+    def _supports_returning() -> bool:
+        version = tuple(int(part) for part in sqlite3.sqlite_version.split("."))
+        return version >= SqliteStore._RETURNING_MIN
+
+    def claim_many(
+        self, items: Sequence[tuple[str, str]], ttl_seconds: float
+    ) -> dict[str, Claim]:
+        """Claim many keys, with one INSERT for the ones that are simply free.
+
+        The fresh-claim path is the whole win: a bulk run is overwhelmingly
+        keys nobody has seen, and those collapse into a single multi-row INSERT
+        instead of N round trips.
+
+        Everything that INSERT does not win goes to `claim` one key at a time.
+        That path carries the expired-lease reclaim and its `request_hash`
+        divergence guard — the property the library exists to provide.
+        Reimplementing it in set-based SQL to save round trips on the *uncommon*
+        case would trade the core guarantee for a speedup on contended keys, so
+        the audited implementation is reused instead.
+
+        Winners come from `RETURNING`, which names exactly the rows that landed.
+        Inferring them by reading state back would be attribution by guesswork:
+        a row inserted by another process between the write and the read looks
+        identical, and crediting ourselves with a claim we did not win is a
+        double execution. Without `RETURNING` the whole batch falls back to
+        `claim`, because a slower correct answer beats a faster wrong one.
+        """
+        for key, _ in items:
+            check_key_length(key, self.max_key_length, "sqlite")
+        if not items:
+            return {}
+
+        results: dict[str, Claim] = {}
+        if self._supports_returning():
+            with self._lock:
+                placeholders = ", ".join(
+                    f"(?, ?, ?, {_NOW}, {_NOW}, {_NOW} + ?)" for _ in items
+                )
+                params: list[Any] = []
+                for key, request_hash in items:
+                    params.extend(
+                        (key, State.IN_PROGRESS.value, request_hash, ttl_seconds)
+                    )
+                rows = self._conn.execute(
+                    f"""
+                    INSERT INTO justonce_keys
+                        (key, state, request_hash, created_at, updated_at, expires_at)
+                    VALUES {placeholders}
+                    ON CONFLICT(key) DO NOTHING
+                    RETURNING key
+                    """,
+                    params,
+                ).fetchall()
+                for (key,) in rows:
+                    record = self._get(key)
+                    if record is not None:
+                        results[key] = Claim(won=True, record=record)
+
+        for key, request_hash in items:
+            if key not in results:
+                results[key] = self.claim(key, request_hash, ttl_seconds)
+        return results
 
     def claim(self, key: str, request_hash: str, ttl_seconds: float) -> Claim:
         check_key_length(key, self.max_key_length, "sqlite")

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import enum
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -105,6 +106,40 @@ class Claim:
     @property
     def lost(self) -> bool:
         return not self.won
+
+
+@runtime_checkable
+class BatchClaimStore(Protocol):
+    """A store that can claim many keys in fewer round trips than one each.
+
+    Deliberately **not** part of `Store`. `Store` is a structural protocol that
+    nothing inherits from, so a new required method would break every existing
+    implementation, including third-party ones — which is the opposite of what
+    an optional optimisation should cost. A store opts in by defining
+    `claim_many`; everything else keeps working untouched and the caller loops.
+    """
+
+    def claim_many(
+        self, items: Sequence[tuple[str, str]], ttl_seconds: float
+    ) -> dict[str, Claim]:
+        """Claim each `(key, request_hash)`; return the outcome per key.
+
+        **Not atomic across keys, on purpose.** Each key is claimed
+        independently, exactly as `claim` would. Wrapping the batch in one
+        transaction would mean a single already-held key rolls back claims the
+        caller had legitimately won — turning a normal, expected outcome
+        (losing one key) into the loss of the whole batch.
+
+        Must return one entry per distinct key, and each entry must be the same
+        `Claim` that `claim(key, request_hash, ttl_seconds)` would have
+        produced. An implementation that is faster but disagrees with `claim`
+        is a correctness bug, not an optimisation; the conformance suite checks
+        the two against each other.
+
+        Duplicate keys must be rejected, not silently collapsed — see
+        `ValueError` in the caller-side helper.
+        """
+        ...
 
 
 @runtime_checkable

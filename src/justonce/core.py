@@ -17,6 +17,7 @@ was charged" is a fact worth keeping.
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any, Callable, TypeVar
 
@@ -33,7 +34,7 @@ from .machine import (
     unguarded_run_allowed,
 )
 from .namespacing import belongs, check_namespace, scoped, unscoped
-from .stores.base import Record, Store
+from .stores.base import Claim, Record, Store
 
 T = TypeVar("T")
 
@@ -211,6 +212,50 @@ class Idempotent:
 
         emit(self.hooks, "effect_finished", key, time.monotonic() - started, True)
         return Result(value=value, executed=True, record=self._strip(self.store.lookup(stored)))
+
+    def claim_many(
+        self, items: Sequence[tuple[str, str]], *, ttl_seconds: float | None = None
+    ) -> dict[str, Claim]:
+        """Claim many keys at once; return the outcome per key.
+
+        Claiming 10,000 keys one round trip at a time makes bulk work — payout
+        runs, nightly reconciliation, backfills — impractical (#28). A store
+        that can do it in fewer statements says so by implementing
+        `claim_many`; every other store, including third-party ones, is looped
+        over here and keeps working unchanged.
+
+        **Not atomic across keys.** Losing one key is an ordinary outcome, not
+        a batch failure: rolling back the whole batch because one key was
+        already held would discard claims the caller had legitimately won.
+
+        Keys are namespaced and length-checked exactly as `claim` does, so a
+        batch cannot smuggle in a key a single claim would have refused.
+        """
+        if len({key for key, _ in items}) != len(items):
+            # Collapsing them would hide a divergence: two different payloads
+            # under one key in one batch is precisely what the request hash
+            # exists to catch, and a dict keyed by key can only report one.
+            raise ValueError("claim_many received duplicate keys in one batch")
+
+        ttl = self.ttl_seconds if ttl_seconds is None else ttl_seconds
+        stored = [(scoped(self.namespace, key), request_hash) for key, request_hash in items]
+
+        batch = getattr(self.store, "claim_many", None)
+        if callable(batch):
+            claims = batch(stored, ttl)
+        else:
+            claims = {
+                key: self.store.claim(key, request_hash, ttl)
+                for key, request_hash in stored
+            }
+        # Back to caller-facing keys: the namespace is this engine's business,
+        # and a caller that passed `order_1` must not get `tenant:order_1` back.
+        return {
+            unscoped(self.namespace, stored_key): replace(
+                claim, record=self._strip(claim.record)
+            )
+            for stored_key, claim in claims.items()
+        }
 
     def sweep(self, *, now: float | None = None) -> int:
         """Delete terminal records past their retention window.
