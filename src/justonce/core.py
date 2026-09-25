@@ -289,7 +289,28 @@ class Idempotent:
             return None
         return max(0.0, self.store.now() - written)
 
-    def unresolved(self, *, limit: int = 100) -> list[Record]:
+    def now(self) -> float:
+        """The store's clock, not the caller's.
+
+        Ages shown to an operator are computed against this for the same reason
+        leases are: a host whose clock runs fast would otherwise report an age
+        that never happened, and that age is the number someone decides whether
+        to reconcile on.
+        """
+        return self.store.now()
+
+    def lookup(self, key: str) -> Record | None:
+        """What the store knows about one key, or `None`.
+
+        Namespaced like everything else on the engine: a caller that ran
+        `order_1` asks about `order_1`, not `tenant:order_1`. A per-tenant
+        engine therefore cannot read another tenant's record by guessing a key,
+        which is the same boundary `unresolved` enforces for lists.
+        """
+        record = self.store.lookup(scoped(self.namespace, key))
+        return self._strip(record)
+
+    def unresolved(self, *, older_than: float | None = None, limit: int = 100) -> list[Record]:
         """Effects whose outcome was never observed — reconciliation's input.
 
         Scoped to this engine's namespace, because the alternative hands one
@@ -302,15 +323,20 @@ class Idempotent:
         first page and a scoped caller is told its queue is empty while its own
         records sit on page two. So it reads forward until it has `limit` of its
         own or the store is exhausted.
+
+        `older_than` is passed to the store rather than filtered here, for the
+        same reason: filtering after the fact would page through records the
+        store could have skipped, and would let a burst of recent unknowns hide
+        the old ones that actually need reconciling.
         """
         if self.namespace is None:
-            return self.store.unresolved(limit=limit)
+            return self.store.unresolved(older_than=older_than, limit=limit)
 
         found: list[Record] = []
         page = max(limit * 4, 100)
         seen = 0
         while len(found) < limit:
-            batch = self.store.unresolved(limit=seen + page)[seen:]
+            batch = self.store.unresolved(older_than=older_than, limit=seen + page)[seen:]
             if not batch:
                 break
             seen += len(batch)
