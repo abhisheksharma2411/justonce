@@ -322,6 +322,27 @@ justonce sweep --engine myapp.idempotency:engine
 describing a store, so the sweeper cannot drift from the store the application
 is actually writing to.
 
+During an incident the same command reads the ledger, without mutating anything:
+
+```sh
+justonce unresolved --engine myapp.idempotency:engine --older-than 15m
+# charge:order_991   unknown   attempts=1   age=1840s
+
+justonce inspect --engine myapp.idempotency:engine charge:order_991
+# key:          charge:order_991
+# state:        unknown
+# attempts:     1
+# request_hash: 9f2c…
+# age:          1840s
+# has_response: False
+```
+
+`unresolved` is reconciliation's work list: effects that ran, or may have run, with
+no recorded outcome. The count goes to stderr so stdout stays pipeable. `inspect`
+exits 1 when no record exists, so a script can tell "nothing here" from "fine"
+without parsing text. Both are namespaced like the rest of the engine — a
+per-tenant engine cannot read another tenant's record by guessing a key.
+
 As a cron entry:
 
 ```cron
