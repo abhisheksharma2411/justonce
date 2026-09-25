@@ -84,6 +84,28 @@ class KeyTooLongError(JustOnceError):
         self.backend = backend
 
 
+class ResponseDecodeError(JustOnceError):
+    """A stored response could not be decoded back into the recorded value.
+
+    Raised on replay when the engine's codec cannot read a row it once wrote —
+    a rotated encryption key, a codec swapped for an incompatible one, a
+    corrupted column.
+
+    Deliberately an error rather than a `None` response. "We cannot tell you
+    what the provider said" is the truth, and `None` would let the caller read
+    a real prior charge as "no body" — the one answer that is actively
+    dangerous here. The original exception is kept as `__cause__`.
+    """
+
+    def __init__(self, key: str) -> None:
+        super().__init__(
+            f"stored response for {key!r} could not be decoded; the recorded outcome "
+            "exists but cannot be read back. Check the engine's codec against the one "
+            "that wrote this record before retrying the effect."
+        )
+        self.key = key
+
+
 class StoreError(JustOnceError):
     """The backing store could not be reached or returned something unusable.
 

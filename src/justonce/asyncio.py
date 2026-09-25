@@ -26,8 +26,9 @@ from collections.abc import Awaitable
 from dataclasses import replace
 from typing import Any, Callable, Protocol, TypeVar, cast, runtime_checkable
 
+from .codecs import ResponseCodec
 from .core import DEFAULT_RETENTION_SECONDS, DEFAULT_TTL_SECONDS
-from .errors import InFlightTimeout, KeyReuseError
+from .errors import InFlightTimeout, KeyReuseError, ResponseDecodeError
 from .hooks import Hooks, emit
 from .keys import fingerprint
 from .machine import (
@@ -143,6 +144,8 @@ class AsyncIdempotent:
         on_store_unavailable: OnStoreUnavailable = OnStoreUnavailable.FAIL_CLOSED,
         hooks: Hooks | None = None,
         namespace: str | None = None,
+        codec: ResponseCodec | None = None,
+        store_response: bool = True,
     ) -> None:
         check_windows(ttl_seconds, retention_seconds)
         check_namespace(namespace)
@@ -158,6 +161,8 @@ class AsyncIdempotent:
         self.on_store_unavailable = on_store_unavailable
         self.hooks = hooks
         self.namespace = namespace
+        self.codec = codec or ResponseCodec()
+        self.store_response = store_response
 
     async def run(
         self,
@@ -208,7 +213,11 @@ class AsyncIdempotent:
             raise
 
         try:
-            await self.store.complete(stored, value, retention_seconds=retention)
+            await self.store.complete(
+                stored,
+                self.codec.encode(value) if self.store_response else None,
+                retention_seconds=retention,
+            )
         except BaseException:
             # The effect DID happen and we could not record it. Leave the key
             # unresolved — releasing it would let a retry apply the effect twice.
@@ -247,6 +256,15 @@ class AsyncIdempotent:
 
     # -- internals ----------------------------------------------------------
 
+    def _decoded(self, key: str, record: Record | None) -> Record | None:
+        """See `Idempotent._decoded` — the loser's view goes through the codec."""
+        if record is None or record.response is None or not self.store_response:
+            return record
+        try:
+            return replace(record, response=self.codec.decode(record.response))
+        except Exception as exc:
+            raise ResponseDecodeError(key) from exc
+
     def _strip(self, record: Record | None) -> Record | None:
         """See `Idempotent._strip` — records go back in the caller's keyspace."""
         return record if record is None else self._rekey(record)
@@ -261,7 +279,10 @@ class AsyncIdempotent:
         self, stored: str, key: str, request_hash: str, record: Record | None
     ) -> Result:
         try:
-            settled = settle(key, record, request_hash, self.on_in_flight)
+            settled = settle(
+                key, self._decoded(key, record), request_hash, self.on_in_flight,
+                self.store_response,
+            )
         except KeyReuseError:
             emit(self.hooks, "key_reuse", key)
             raise
@@ -279,7 +300,8 @@ class AsyncIdempotent:
             await asyncio.sleep(self.poll_interval)
             try:
                 settled = settle(
-                    key, await self.store.lookup(stored), request_hash, OnInFlight.WAIT
+                    key, self._decoded(key, await self.store.lookup(stored)),
+                    request_hash, OnInFlight.WAIT, self.store_response,
                 )
             except KeyReuseError:
                 emit(self.hooks, "key_reuse", key)

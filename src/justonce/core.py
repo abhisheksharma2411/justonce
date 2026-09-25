@@ -20,7 +20,8 @@ import time
 from dataclasses import replace
 from typing import Any, Callable, TypeVar
 
-from .errors import InFlightTimeout, KeyReuseError
+from .codecs import ResponseCodec
+from .errors import InFlightTimeout, KeyReuseError, ResponseDecodeError
 from .hooks import Hooks, emit
 from .keys import fingerprint
 from .machine import (
@@ -79,6 +80,12 @@ class Idempotent:
         namespace: prefixed to every key, so tenants with their own id
             sequences cannot collide. `None` (the default) is the existing
             global keyspace. See `justonce.namespacing`.
+        codec: shapes the response on its way into the store and back. The
+            default stores it as-is, exactly as before. See `justonce.codecs`;
+            this is where encryption at rest belongs.
+        store_response: `False` records the outcome but not the body, so a
+            replay is told the effect already ran and nothing else. Dedup is
+            unchanged; the blast radius of the stored row is much smaller.
     """
 
     def __init__(
@@ -93,12 +100,16 @@ class Idempotent:
         on_store_unavailable: OnStoreUnavailable = OnStoreUnavailable.FAIL_CLOSED,
         hooks: Hooks | None = None,
         namespace: str | None = None,
+        codec: ResponseCodec | None = None,
+        store_response: bool = True,
     ) -> None:
         check_windows(ttl_seconds, retention_seconds)
         check_namespace(namespace)
         self.store = store
         self.hooks = hooks
         self.namespace = namespace
+        self.codec = codec or ResponseCodec()
+        self.store_response = store_response
         self.ttl_seconds = ttl_seconds
         self.on_in_flight = on_in_flight
         self.wait_timeout = wait_timeout
@@ -185,7 +196,11 @@ class Idempotent:
             raise
 
         try:
-            self.store.complete(stored, value, retention_seconds=retention)
+            self.store.complete(
+                stored,
+                self.codec.encode(value) if self.store_response else None,
+                retention_seconds=retention,
+            )
         except BaseException:
             # The effect DID happen; we just could not record it. Leave the key
             # unresolved rather than releasing it — releasing would let a retry
@@ -276,6 +291,23 @@ class Idempotent:
         """
         return Result(value=effect(), executed=True, record=None, guarded=False)
 
+    def _decoded(self, key: str, record: Record | None) -> Record | None:
+        """Run the stored response back through the codec before anyone reads it.
+
+        Applied to the *loser's* view only. The winner already holds the live
+        value and never needs the round trip — decoding there would turn a
+        codec bug into a failure of the call that actually did the work.
+
+        A codec that cannot read its own row raises rather than yielding
+        `None`: see `ResponseDecodeError`.
+        """
+        if record is None or record.response is None or not self.store_response:
+            return record
+        try:
+            return replace(record, response=self.codec.decode(record.response))
+        except Exception as exc:
+            raise ResponseDecodeError(key) from exc
+
     def _strip(self, record: Record | None) -> Record | None:
         """Hand a record back in the caller's keyspace, not the store's.
 
@@ -298,7 +330,10 @@ class Idempotent:
         try:
             # `key`, not `stored`: the error a caller catches names the key they
             # passed, not the one the engine derived from it.
-            settled = settle(key, record, request_hash, self.on_in_flight)
+            settled = settle(
+                key, self._decoded(key, record), request_hash, self.on_in_flight,
+                self.store_response,
+            )
         except KeyReuseError:
             emit(self.hooks, "key_reuse", key)
             raise
@@ -316,7 +351,8 @@ class Idempotent:
             # us polling rather than raise.
             try:
                 settled = settle(
-                    key, self.store.lookup(stored), request_hash, OnInFlight.WAIT
+                    key, self._decoded(key, self.store.lookup(stored)),
+                    request_hash, OnInFlight.WAIT, self.store_response,
                 )
             except KeyReuseError:
                 emit(self.hooks, "key_reuse", key)
