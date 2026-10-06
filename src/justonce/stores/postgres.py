@@ -16,10 +16,19 @@ to decide who holds a lock just moves the race.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import Any
 
 from ..errors import StoreError
-from .base import Claim, Record, State, check_key_length, decode_response
+from .base import (
+    LIKE_ESCAPE,
+    Claim,
+    Record,
+    State,
+    check_key_length,
+    decode_response,
+    like_prefix,
+)
 
 try:  # pragma: no cover - import guard
     import psycopg
@@ -213,6 +222,82 @@ class PostgresStore:
                 params,
             ).fetchall()
         return [self._row(r) for r in rows]
+
+    # -- ledger query (#27) --------------------------------------------------
+
+    def _filters(
+        self,
+        prefix: str | None,
+        states: Sequence[State] | None,
+        since: float | None,
+        until: float | None,
+    ) -> tuple[str, list[Any]]:
+        """Shared WHERE clause for `query` and `count_by_state`.
+
+        One builder for both, so the list and the count above it cannot be
+        answering slightly different questions.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if prefix is not None:
+            # ESCAPE is not optional here: `like_prefix` inserts backslashes,
+            # and Postgres's default escape for LIKE is already backslash only
+            # when `standard_conforming_strings` is on. Naming it is the
+            # difference between a pattern that matches and one that silently
+            # matches nothing.
+            clauses.append(f"key LIKE %s ESCAPE '{LIKE_ESCAPE}'")
+            params.append(like_prefix(prefix))
+        if states is not None:
+            if not states:
+                # "No states" is not "every state", and `IN ()` will not parse.
+                return "WHERE false", []
+            clauses.append("state = ANY(%s)")
+            params.append([State(s).value for s in states])
+        if since is not None:
+            clauses.append("created_at >= %s")
+            params.append(since)
+        if until is not None:
+            clauses.append("created_at < %s")
+            params.append(until)
+        return ("WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    def query(
+        self,
+        *,
+        prefix: str | None = None,
+        states: Sequence[State] | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        limit: int = 100,
+    ) -> list[Record]:
+        """See `justonce.stores.base.LedgerQueryStore.query`."""
+        where, params = self._filters(prefix, states, since, until)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {_COLUMNS} FROM justonce_keys {where} "
+                "ORDER BY created_at ASC, key ASC LIMIT %s",
+                [*params, limit],
+            ).fetchall()
+        return [self._row(r) for r in rows]
+
+    def count_by_state(
+        self,
+        *,
+        prefix: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> dict[State, int]:
+        """See `justonce.stores.base.LedgerQueryStore.count_by_state`."""
+        where, params = self._filters(prefix, None, since, until)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT state, COUNT(*) AS n FROM justonce_keys {where} GROUP BY state",
+                params,
+            ).fetchall()
+        counts = {state: 0 for state in State}
+        for row in rows:
+            counts[State(row["state"])] = int(row["n"])
+        return counts
 
     # -- internals ----------------------------------------------------------
 

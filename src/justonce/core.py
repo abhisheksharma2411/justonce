@@ -19,10 +19,15 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, TypeVar, cast
 
 from .codecs import ResponseCodec
-from .errors import InFlightTimeout, KeyReuseError, ResponseDecodeError
+from .errors import (
+    InFlightTimeout,
+    KeyReuseError,
+    ResponseDecodeError,
+    UnsupportedByStore,
+)
 from .hooks import Hooks, emit
 from .keys import fingerprint
 from .machine import (
@@ -34,7 +39,7 @@ from .machine import (
     unguarded_run_allowed,
 )
 from .namespacing import belongs, check_namespace, scoped, unscoped
-from .stores.base import Claim, Record, Store
+from .stores.base import Claim, Record, State, Store
 
 T = TypeVar("T")
 
@@ -344,6 +349,91 @@ class Idempotent:
                 self._rekey(r) for r in batch if belongs(self.namespace, r.key)
             )
         return found[:limit]
+
+    def query(
+        self,
+        *,
+        prefix: str | None = None,
+        states: Sequence[State] | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        limit: int = 100,
+    ) -> list[Record]:
+        """Read the ledger back by key prefix, state and time window (#27).
+
+        The question this exists for is the incident one: *how many customers
+        were affected in this window, which ones, and is it still happening?*
+        Nothing else in the ecosystem can answer it, because nothing else keeps
+        the record — so the answer has to be exact or it is worse than nothing.
+
+        `prefix` is a literal prefix of the **caller's** key, not a pattern and
+        not the stored key. `%` and `_` in it are matched literally; keys like
+        `charge:v1:order_123` contain one by convention and a raw LIKE would
+        quietly return strangers' records alongside the real ones.
+
+        `since`/`until` bound `created_at` half-open, so windows tile.
+
+        Scoped to this engine's namespace, which here costs nothing: the
+        namespace simply becomes part of the prefix and the store filters on
+        it. `unresolved` has to page-and-discard for the same guarantee because
+        the store cannot filter its list; this one does not.
+
+        Raises `UnsupportedByStore` if the store does not implement the
+        optional query protocol, rather than returning an empty list — see that
+        error for why a silent partial answer is the worse failure.
+        """
+        run = self._ledger_method("query")
+        scoped_prefix = self._scoped_prefix(prefix)
+        records = run(
+            prefix=scoped_prefix, states=states, since=since, until=until, limit=limit
+        )
+        return [self._rekey(r) for r in records]
+
+    def summary(
+        self,
+        *,
+        prefix: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> dict[State, int]:
+        """How many records sit in each state, under `query`'s filters (#27).
+
+        Counted in the store rather than by paging `query`, because "is it
+        still happening" gets asked of windows much larger than any `limit` a
+        caller would pass — and a count derived from a truncated page is a
+        number that looks precise and is not.
+
+        **This does not count suppressed duplicates**, which #27 also asks for,
+        because the ledger does not record them. A lost claim returns
+        `Claim(won=False)` and writes nothing at all; `attempts` counts
+        *reclaims* of an expired lease, which is a different event and far
+        rarer. Reporting `attempts - 1` as a duplicate count would be wrong in
+        both directions at once, and wrong on exactly the screen someone sizes
+        an incident from. Counting them needs a column that does not exist yet.
+        """
+        run = self._ledger_method("count_by_state")
+        counts = run(prefix=self._scoped_prefix(prefix), since=since, until=until)
+        # Re-assert the full set: a third-party store may return only the
+        # states it found, and a caller reading counts[UNKNOWN] mid-incident
+        # should see 0 rather than a KeyError.
+        return {state: counts.get(state, 0) for state in State}
+
+    def _ledger_method(self, name: str) -> Callable[..., Any]:
+        method = getattr(self.store, name, None)
+        if not callable(method):
+            raise UnsupportedByStore(self.store, f"ledger queries ({name})")
+        return cast("Callable[..., Any]", method)
+
+    def _scoped_prefix(self, prefix: str | None) -> str | None:
+        """The caller's prefix as the store sees it.
+
+        `None` with no namespace means no filter at all. With a namespace it
+        becomes the namespace prefix itself, which is what keeps one tenant's
+        query off another tenant's keys.
+        """
+        if self.namespace is None:
+            return prefix
+        return scoped(self.namespace, prefix or "")
 
     # -- internals ----------------------------------------------------------
 

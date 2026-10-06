@@ -33,10 +33,19 @@ loudly in `__init__` when it detects the risky combination.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import Any, Literal
 
 from ..errors import AmbientTransactionError, StoreError
-from .base import Claim, Record, State, check_key_length, decode_response
+from .base import (
+    LIKE_ESCAPE,
+    Claim,
+    Record,
+    State,
+    check_key_length,
+    decode_response,
+    like_prefix,
+)
 
 try:  # pragma: no cover - import guard
     from django.db import connections
@@ -354,6 +363,86 @@ class DjangoStore:
                 params,
             )
             return [self._row(r) for r in cur.fetchall()]
+
+    # -- ledger query (#27) --------------------------------------------------
+
+    @property
+    def _escape_literal(self) -> str:
+        """The escape character as each vendor's parser must see it written.
+
+        MySQL processes backslash escapes *inside* string literals unless
+        `NO_BACKSLASH_ESCAPES` is set, so `ESCAPE '\\'` written once escapes the
+        closing quote and the statement fails to parse. Postgres with
+        `standard_conforming_strings` on (the default) and SQLite both take the
+        backslash literally and must see exactly one.
+
+        A doubled backslash on those two would set the escape character *to* a
+        backslash-backslash, which is not one character, and Postgres rejects
+        it outright.
+        """
+        return LIKE_ESCAPE * 2 if self.vendor == "mysql" else LIKE_ESCAPE
+
+    def _filters(
+        self,
+        prefix: str | None,
+        states: Sequence[State] | None,
+        since: float | None,
+        until: float | None,
+    ) -> tuple[str, list[Any]]:
+        """Shared WHERE clause for `query` and `count_by_state`."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if prefix is not None:
+            clauses.append(f"{self._key_col} LIKE %s ESCAPE '{self._escape_literal}'")
+            params.append(like_prefix(prefix))
+        if states is not None:
+            if not states:
+                # "No states" is not "every state"; `IN ()` will not parse.
+                return "WHERE 1 = 0", []
+            clauses.append(f"state IN ({','.join(['%s'] * len(states))})")
+            params.extend(State(st).value for st in states)
+        if since is not None:
+            clauses.append("created_at >= %s")
+            params.append(since)
+        if until is not None:
+            clauses.append("created_at < %s")
+            params.append(until)
+        return ("WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    def query(
+        self,
+        *,
+        prefix: str | None = None,
+        states: Sequence[State] | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        limit: int = 100,
+    ) -> list[Record]:
+        """See `justonce.stores.base.LedgerQueryStore.query`."""
+        where, params = self._filters(prefix, states, since, until)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {self._cols} FROM {TABLE} {where} "
+                f"ORDER BY created_at ASC, {self._key_col} ASC LIMIT %s",
+                [*params, limit],
+            )
+            return [self._row(r) for r in cur.fetchall()]
+
+    def count_by_state(
+        self,
+        *,
+        prefix: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> dict[State, int]:
+        """See `justonce.stores.base.LedgerQueryStore.count_by_state`."""
+        where, params = self._filters(prefix, None, since, until)
+        counts = {state: 0 for state in State}
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT state, COUNT(*) FROM {TABLE} {where} GROUP BY state", params)
+            for row in cur.fetchall():
+                counts[State(row[0])] = int(row[1])
+        return counts
 
     # -- internals ----------------------------------------------------------
 

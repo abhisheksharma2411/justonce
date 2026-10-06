@@ -20,10 +20,10 @@ import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, cast
 
 from .errors import KeyTooLongError
-from .stores.base import Record, State, Store
+from .stores.base import QueryableStore, Record, State, Store
 
 TTL = 60.0
 
@@ -367,6 +367,120 @@ class StoreConformanceTests:
             f"store accepted a {limit + 1}-character key with a declared limit "
             f"of {limit}; it will truncate and collide"
         )
+
+    # -- ledger query, for stores that opt in (#27) --------------------------
+
+    def _ledger(self, store: Store) -> QueryableStore:
+        """Skip the ledger tests on a store that does not implement them.
+
+        `LedgerQueryStore` is optional by design, so a store without it is
+        conformant. It is skipped rather than passed silently, because a store
+        that *means* to support queries and has a typo'd method name would
+        otherwise show a green suite.
+        """
+        if not callable(getattr(store, "query", None)):
+            try:
+                import pytest
+            except ImportError:  # pragma: no cover - only without pytest
+                return cast(QueryableStore, store)
+            pytest.skip(f"{type(store).__name__} does not implement LedgerQueryStore")
+        return cast(QueryableStore, store)
+
+    def test_query_prefix_is_literal_not_a_like_pattern(self) -> None:
+        """The one that matters. `_` is a LIKE wildcard and a real key character.
+
+        `operation_key` produces `charge:v1:order_123`, so every deployment has
+        underscores in its keys. A prefix matched as a raw pattern returns keys
+        that merely differ in that position — during an incident, that is
+        somebody else's customer in your blast radius.
+        """
+        store = self._ledger(self.make_store())
+        store.claim("charge:v1:order_1", "h", TTL)
+        store.claim("charge:v1:orderX1", "h", TTL)
+        store.claim("charge:v1:order-1", "h", TTL)
+
+        keys = {r.key for r in store.query(prefix="charge:v1:order_")}
+        assert keys == {"charge:v1:order_1"}, (
+            f"prefix matched as a pattern: {sorted(keys)} — `_` must be escaped"
+        )
+
+    def test_query_prefix_escapes_percent_too(self) -> None:
+        store = self._ledger(self.make_store())
+        store.claim("report:100%:a", "h", TTL)
+        store.claim("report:100pc:a", "h", TTL)
+
+        keys = {r.key for r in store.query(prefix="report:100%")}
+        assert keys == {"report:100%:a"}, f"`%` must be escaped, got {sorted(keys)}"
+
+    def test_query_filters_by_state(self) -> None:
+        store = self._ledger(self.make_store())
+        store.claim("a", "h", TTL)
+        store.claim("b", "h", TTL)
+        store.complete("b", {"ok": True})
+
+        in_progress = {r.key for r in store.query(states=[State.IN_PROGRESS])}
+        succeeded = {r.key for r in store.query(states=[State.SUCCEEDED])}
+        assert in_progress == {"a"}
+        assert succeeded == {"b"}
+
+    def test_query_with_no_states_matches_nothing(self) -> None:
+        """An empty sequence means "none", never "all".
+
+        The caller that hits this is building the state filter from user input
+        — a dashboard with every checkbox cleared. Reading it as "no filter"
+        shows the operator the whole ledger and labels it as the selection.
+        """
+        store = self._ledger(self.make_store())
+        store.claim("a", "h", TTL)
+        assert store.query(states=[]) == []
+
+    def test_query_window_is_half_open(self) -> None:
+        """`since <= created_at < until`, so adjacent windows tile."""
+        store = self._ledger(self.make_store())
+        store.claim("a", "h", TTL)
+        created = _found(store.lookup("a")).created_at
+        assert created is not None
+
+        assert [r.key for r in store.query(since=created)] == ["a"]
+        assert store.query(until=created) == []
+        assert [r.key for r in store.query(since=created, until=created + 1)] == ["a"]
+
+    def test_count_by_state_reports_every_state(self) -> None:
+        """Including the empty ones — a mid-incident read must not KeyError."""
+        store = self._ledger(self.make_store())
+        store.claim("a", "h", TTL)
+        counts = store.count_by_state()
+        assert set(counts) == set(State), f"missing states: {set(State) - set(counts)}"
+        assert counts[State.IN_PROGRESS] == 1
+        assert counts[State.UNKNOWN] == 0
+
+    def test_count_agrees_with_query(self) -> None:
+        """The list and the number above it must answer the same question."""
+        store = self._ledger(self.make_store())
+        for key in ("charge:v1:order_1", "charge:v1:orderX1", "refund:v1:r1"):
+            store.claim(key, "h", TTL)
+        store.mark_unknown("charge:v1:order_1")
+
+        prefix = "charge:v1:order_"
+        counts = store.count_by_state(prefix=prefix)
+        listed = store.query(prefix=prefix, limit=1000)
+        assert sum(counts.values()) == len(listed)
+        for state in State:
+            assert counts[state] == sum(1 for r in listed if r.state is state)
+
+    def test_query_is_oldest_first(self) -> None:
+        store = self._ledger(self.make_store())
+        for key in ("a", "b", "c"):
+            store.claim(key, "h", TTL)
+            time.sleep(0.01)  # past the coarsest store clock's resolution
+        created = [r.created_at for r in store.query(limit=1000)]
+        assert created == sorted(c for c in created if c is not None)
+
+    def test_query_limit_is_honoured(self) -> None:
+        store = self._ledger(self.make_store())
+        for key in ("a", "b", "c"):
+            store.claim(key, "h", TTL)
+        assert len(store.query(limit=2)) == 2
 
     def test_lookup_missing_key_returns_none(self) -> None:
         assert self.make_store().lookup("nope") is None
