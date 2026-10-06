@@ -140,3 +140,22 @@ class StoreError(JustOnceError):
     Deliberately *not* swallowed into "assume not seen". A store that cannot
     answer "has this run?" gives you no basis for running the effect.
     """
+
+
+class UnsupportedByStore(JustOnceError):
+    """The configured store does not implement an optional capability.
+
+    Raised rather than degraded to a partial answer. The ledger query API is
+    read during an incident, and the two possible silent degradations are both
+    worse than an error: returning `[]` reads as "nothing was affected", and
+    scanning whatever the store *can* enumerate reads as a complete answer over
+    an arbitrary subset. Either one gets acted on.
+    """
+
+    def __init__(self, store: object, capability: str) -> None:
+        self.capability = capability
+        self.store_type = type(store).__name__
+        super().__init__(
+            f"{self.store_type} does not support {capability}. Stores opt in by "
+            f"implementing it; see justonce.stores.base for the protocol."
+        )

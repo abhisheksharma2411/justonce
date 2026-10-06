@@ -58,6 +58,36 @@ def check_key_length(key: str, limit: int | None, backend: str) -> None:
         raise KeyTooLongError(key, limit, backend)
 
 
+#: The character the stores pass to SQL `ESCAPE`. Backslash is the conventional
+#: choice and is not special to any of the backends' LIKE parsers by default.
+LIKE_ESCAPE = "\\"
+
+
+def like_prefix(prefix: str) -> str:
+    """Turn a literal key prefix into a LIKE pattern that matches only it.
+
+    `LIKE` reads `%` and `_` as wildcards, and justonce keys are *built* from
+    user data — `charge:v1:order_123` is the documented key shape, and the
+    underscore in it is a single-character wildcard. Matching on the raw string
+    silently widens the query: a prefix of `order_1` also returns `order-1`,
+    `orderX1` and any other key differing in that one position.
+
+    During an incident that is the worst possible failure. The query exists to
+    answer "which customers were affected", and an over-wide prefix answers it
+    with strangers' keys — so the operator either acts on a key that was never
+    affected, or reads an inflated blast radius and escalates on it.
+
+    Escapes `%`, `_` and the escape character itself, then appends `%` as the
+    only wildcard in the pattern. Pair with `ESCAPE '\\'` in the statement.
+    """
+    escaped = (
+        prefix.replace(LIKE_ESCAPE, LIKE_ESCAPE + LIKE_ESCAPE)
+        .replace("%", LIKE_ESCAPE + "%")
+        .replace("_", LIKE_ESCAPE + "_")
+    )
+    return escaped + "%"
+
+
 class State(str, enum.Enum):
     """Lifecycle of a claimed effect.
 
@@ -138,6 +168,71 @@ class BatchClaimStore(Protocol):
 
         Duplicate keys must be rejected, not silently collapsed — see
         `ValueError` in the caller-side helper.
+        """
+        ...
+
+
+@runtime_checkable
+class LedgerQueryStore(Protocol):
+    """A store that can read its ledger back by prefix, state and time window.
+
+    Deliberately **not** part of `Store`, for the reason `BatchClaimStore`
+    gives: `Store` is a structural protocol nothing inherits from, so a new
+    required method breaks every implementation that exists, including
+    third-party ones. A store opts in by defining these two methods.
+
+    There is no loop-in-the-caller fallback the way there is for `claim_many`,
+    because `Store` exposes no way to enumerate records — only `lookup` of a
+    key you already know and `unresolved`. A caller that needs the ledger and
+    holds a store without these gets a clear `UnsupportedByStore` rather than a
+    silent partial answer, which during an incident is the difference between
+    "this store cannot tell you" and "nothing matched".
+    """
+
+    def query(
+        self,
+        *,
+        prefix: str | None = None,
+        states: Sequence[State] | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        limit: int = 100,
+    ) -> list[Record]:
+        """Records matching every supplied filter, oldest first.
+
+        `prefix` is a **literal** key prefix, not a pattern — implementations
+        must route it through `like_prefix` so `%` and `_` in real keys cannot
+        widen the match.
+
+        `since`/`until` bound `created_at`, which is when the key was first
+        claimed. That is the column that answers "what happened in this
+        window"; `updated_at` moves when an outcome lands and would re-date an
+        incident to the moment someone reconciled it.
+
+        Bounds are half-open — `since <= created_at < until` — so adjacent
+        windows tile without double-counting a record on the boundary.
+
+        Oldest first, matching `unresolved`, so paging through a window is
+        stable while new keys are still being claimed.
+        """
+        ...
+
+    def count_by_state(
+        self,
+        *,
+        prefix: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> dict[State, int]:
+        """How many records each state holds, under the same filters as `query`.
+
+        Counts in the store rather than paging everything back, because the
+        question "is it still happening" is asked of windows far larger than
+        any sane `limit`.
+
+        Every `State` appears, including the ones with no rows — a caller
+        reading `counts[State.UNKNOWN]` during an incident should get `0`, not
+        a `KeyError` from the one store that happened to have none.
         """
         ...
 
@@ -263,3 +358,14 @@ class Store(Protocol):
     def unresolved(self, *, older_than: float | None = None, limit: int = 100) -> list[Record]:
         """Records in `UNKNOWN`, oldest first — the reconciliation work list."""
         ...
+
+
+@runtime_checkable
+class QueryableStore(Store, LedgerQueryStore, Protocol):
+    """A `Store` that also implements `LedgerQueryStore`.
+
+    Exists so operator-facing code — a reconciliation worker, an incident
+    dashboard — can say in one annotation that it needs both halves, rather
+    than taking a `Store` and discovering at run time that the ledger cannot be
+    read. All four bundled stores satisfy it.
+    """

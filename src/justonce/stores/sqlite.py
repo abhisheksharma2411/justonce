@@ -18,7 +18,15 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import StoreError
-from .base import Claim, Record, State, check_key_length, decode_response
+from .base import (
+    LIKE_ESCAPE,
+    Claim,
+    Record,
+    State,
+    check_key_length,
+    decode_response,
+    like_prefix,
+)
 
 #: SQLite's clock, as a Unix timestamp with subsecond resolution.
 #:
@@ -257,6 +265,82 @@ class SqliteStore:
                 params,
             ).fetchall()
         return [self._row(r) for r in rows]
+
+    # -- ledger query (#27) --------------------------------------------------
+
+    def _filters(
+        self,
+        prefix: str | None,
+        states: Sequence[State] | None,
+        since: float | None,
+        until: float | None,
+    ) -> tuple[str, list[Any]]:
+        """Shared WHERE clause for `query` and `count_by_state`.
+
+        One builder for both so a filter cannot mean one thing in the list and
+        another in the count — an operator reading "3 unknown" above a list of
+        two is being told the window is still moving when it is not.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if prefix is not None:
+            # `like_prefix` escapes `%` and `_`; without the ESCAPE clause
+            # SQLite treats the backslash it inserts as a literal character and
+            # the pattern silently stops matching anything.
+            clauses.append(f"key LIKE ? ESCAPE '{LIKE_ESCAPE}'")
+            params.append(like_prefix(prefix))
+        if states is not None:
+            if not states:
+                # An empty sequence means "no states", not "every state". A
+                # `WHERE state IN ()` is a syntax error in SQLite, and dropping
+                # the clause would widen the query to everything.
+                return "WHERE 0", []
+            clauses.append(f"state IN ({','.join('?' * len(states))})")
+            params.extend(State(s).value for s in states)
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(since)
+        if until is not None:
+            clauses.append("created_at < ?")
+            params.append(until)
+        return ("WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    def query(
+        self,
+        *,
+        prefix: str | None = None,
+        states: Sequence[State] | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        limit: int = 100,
+    ) -> list[Record]:
+        """See `justonce.stores.base.LedgerQueryStore.query`."""
+        where, params = self._filters(prefix, states, since, until)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM justonce_keys {where} ORDER BY created_at ASC, key ASC LIMIT ?",
+                [*params, limit],
+            ).fetchall()
+        return [self._row(r) for r in rows]
+
+    def count_by_state(
+        self,
+        *,
+        prefix: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> dict[State, int]:
+        """See `justonce.stores.base.LedgerQueryStore.count_by_state`."""
+        where, params = self._filters(prefix, None, since, until)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT state, COUNT(*) AS n FROM justonce_keys {where} GROUP BY state",
+                params,
+            ).fetchall()
+        counts = {state: 0 for state in State}
+        for row in rows:
+            counts[State(row["state"])] = row["n"]
+        return counts
 
     def close(self) -> None:
         with self._lock:

@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Sequence
 from typing import Any
 
 from .base import Claim, Record, State, check_key_length, decode_response
@@ -160,6 +161,69 @@ class MemoryStore:
             ]
             rows.sort(key=lambda r: r["updated_at"])
             return [self._row(r) for r in rows[:limit]]
+
+    # -- ledger query (#27) --------------------------------------------------
+
+    def query(
+        self,
+        *,
+        prefix: str | None = None,
+        states: Sequence[State] | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        limit: int = 100,
+    ) -> list[Record]:
+        """See `justonce.stores.base.LedgerQueryStore.query`.
+
+        Matches the prefix with `str.startswith` rather than by building a LIKE
+        pattern, which is the SQL stores' problem and not this one's — the
+        wildcard hazard `like_prefix` exists for cannot arise here. The two must
+        still agree, and the conformance suite checks them against each other on
+        keys containing `%` and `_`.
+        """
+        with self._lock:
+            rows = [
+                row
+                for row in self._rows.values()
+                if self._matches(row, prefix, states, since, until)
+            ]
+        rows.sort(key=lambda r: (r["created_at"], r["key"]))
+        return [self._row(r) for r in rows[:limit]]
+
+    def count_by_state(
+        self,
+        *,
+        prefix: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> dict[State, int]:
+        """See `justonce.stores.base.LedgerQueryStore.count_by_state`."""
+        counts = {state: 0 for state in State}
+        with self._lock:
+            for row in self._rows.values():
+                if self._matches(row, prefix, None, since, until):
+                    counts[State(row["state"])] += 1
+        return counts
+
+    @staticmethod
+    def _matches(
+        row: dict[str, Any],
+        prefix: str | None,
+        states: Sequence[State] | None,
+        since: float | None,
+        until: float | None,
+    ) -> bool:
+        if prefix is not None and not row["key"].startswith(prefix):
+            return False
+        if states is not None and State(row["state"]) not in states:
+            return False
+        created = row["created_at"]
+        # Half-open, so adjacent windows tile without counting a record twice.
+        if since is not None and (created is None or created < since):
+            return False
+        if until is None:
+            return True
+        return created is not None and created < until
 
     # -- internals ----------------------------------------------------------
 

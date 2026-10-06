@@ -40,6 +40,7 @@ from .errors import (
     OperationInFlightError,
     ResponseDecodeError,
     StoreError,
+    UnsupportedByStore,
 )
 from .hooks import Hooks
 from .keys import fingerprint, operation_key
@@ -72,6 +73,7 @@ __all__ = [
     "Store",
     "StoreError",
     "ThreadedStore",
+    "UnsupportedByStore",
     "__version__",
     "async_idempotent",
     "configure",
