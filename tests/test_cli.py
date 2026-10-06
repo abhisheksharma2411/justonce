@@ -144,3 +144,120 @@ def test_a_bad_target_exits_non_zero_without_sweeping(monkeypatch, capsys):
 
     assert engine.swept == 0
     assert "justonce sweep:" in capsys.readouterr().err
+
+
+# ─── unresolved / inspect (#23) ──────────────────────────────────────────────
+
+
+def _engine_with(tmp_path):
+    from justonce import Idempotent
+    from justonce.stores.memory import MemoryStore
+
+    engine = Idempotent(MemoryStore())
+    engine.store.claim("order_1", "h1", 60)
+    engine.store.mark_unknown("order_1")
+    engine.store.claim("order_2", "h2", 60)
+    engine.store.complete("order_2", {"id": "ch_2"}, retention_seconds=3600)
+    return engine
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [("90", 90), ("30s", 30), ("15m", 900), ("1h", 3600), ("7d", 604800), ("1.5h", 5400)],
+)
+def test_durations_parse(text, seconds):
+    from justonce.cli import parse_duration
+
+    assert parse_duration(text) == seconds
+
+
+@pytest.mark.parametrize("text", ["1hr", "", "abc", "h", "-1h"])
+def test_a_duration_that_is_not_understood_is_refused_not_guessed(text):
+    # An operator typing `1hr` mid-incident must be told, not handed one second
+    # and an empty list that reads like good news.
+    from justonce.cli import parse_duration
+
+    with pytest.raises(ValueError):
+        parse_duration(text)
+
+
+def test_unresolved_lists_only_unknown_records(monkeypatch, tmp_path, capsys):
+    _install(monkeypatch, "recon_mod", engine=_engine_with(tmp_path))
+    out = io.StringIO()
+
+    assert main(["unresolved", "--engine", "recon_mod:engine"], out=out) == 0
+
+    body = out.getvalue()
+    assert "order_1" in body          # UNKNOWN
+    assert "order_2" not in body      # SUCCEEDED is not reconciliation's problem
+    # Count on stderr so stdout stays pipeable.
+    assert "1 unresolved record(s)" in capsys.readouterr().err
+
+
+def test_older_than_excludes_fresh_records(monkeypatch, tmp_path):
+    _install(monkeypatch, "recon_fresh", engine=_engine_with(tmp_path))
+    out = io.StringIO()
+
+    assert main(
+        ["unresolved", "--engine", "recon_fresh:engine", "--older-than", "1h"], out=out
+    ) == 0
+    assert out.getvalue() == ""
+
+
+def test_a_bad_duration_exits_two_without_listing(monkeypatch, tmp_path, capsys):
+    _install(monkeypatch, "recon_bad", engine=_engine_with(tmp_path))
+    out = io.StringIO()
+
+    assert main(
+        ["unresolved", "--engine", "recon_bad:engine", "--older-than", "1hr"], out=out
+    ) == 2
+    assert out.getvalue() == ""
+    assert "30s, 15m, 1h, 7d" in capsys.readouterr().err
+
+
+def test_inspect_prints_the_record(monkeypatch, tmp_path):
+    _install(monkeypatch, "inspect_mod", engine=_engine_with(tmp_path))
+    out = io.StringIO()
+
+    assert main(["inspect", "--engine", "inspect_mod:engine", "order_2"], out=out) == 0
+
+    body = out.getvalue()
+    assert "state:        succeeded" in body
+    assert "has_response: True" in body
+
+
+def test_inspect_exits_one_for_a_missing_key(monkeypatch, tmp_path, capsys):
+    # A script must be able to tell "no such key" from "the key is fine"
+    # without parsing text, so this is 1 rather than 0.
+    _install(monkeypatch, "inspect_missing", engine=_engine_with(tmp_path))
+    out = io.StringIO()
+
+    assert main(["inspect", "--engine", "inspect_missing:engine", "nope"], out=out) == 1
+    assert out.getvalue() == ""
+    assert "no record for" in capsys.readouterr().err
+
+
+def test_inspect_is_namespaced(monkeypatch):
+    # A per-tenant engine must not read another tenant's record by guessing the
+    # stored key, which is the boundary `unresolved` already enforces for lists.
+    from justonce import Idempotent
+    from justonce.stores.memory import MemoryStore
+
+    engine = Idempotent(MemoryStore(), namespace="tenant")
+    engine.store.claim("tenant:k1", "h", 60)
+    _install(monkeypatch, "ns_mod", engine=engine)
+
+    out = io.StringIO()
+    assert main(["inspect", "--engine", "ns_mod:engine", "k1"], out=out) == 0
+    assert "key:          k1" in out.getvalue()
+
+    # The stored form must not resolve.
+    assert main(["inspect", "--engine", "ns_mod:engine", "tenant:k1"], out=io.StringIO()) == 1
+
+
+def test_sweep_does_not_demand_methods_it_never_calls(monkeypatch):
+    # Requiring every method any subcommand might want would reject a
+    # legitimate minimal engine from a command that never calls them.
+    _install(monkeypatch, "minimal_mod", engine=FakeEngine(removed=1))
+    out = io.StringIO()
+    assert main(["sweep", "--engine", "minimal_mod:engine"], out=out) == 0
