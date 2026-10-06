@@ -39,6 +39,7 @@ from .machine import (
     unguarded_run_allowed,
 )
 from .namespacing import belongs, check_namespace, scoped, unscoped
+from .reconcile import Action, Applied, Plan, ReconciliationProvider, build_plan
 from .stores.base import Claim, Record, State, Store
 
 T = TypeVar("T")
@@ -434,6 +435,77 @@ class Idempotent:
         if self.namespace is None:
             return prefix
         return scoped(self.namespace, prefix or "")
+    def plan_reconciliation(
+        self,
+        provider: ReconciliationProvider,
+        *,
+        older_than: float | None = None,
+        limit: int = 100,
+    ) -> Plan:
+        """Ask `provider` what happened to each unresolved key. Writes nothing (#23).
+
+        This is the half an operator reads before anything is allowed to move.
+        It is separate from `apply_reconciliation` rather than being a
+        `dry_run=True` flag on one method, because a flag that defaults to safe
+        is still one typo away from unsafe, and the unsafe direction here
+        rewrites money-movement records.
+
+        `older_than` is worth setting. A record that went UNKNOWN two seconds
+        ago may simply be in flight — the effect is still running and the
+        outcome write has not happened yet. Reconciling it races the process
+        that owns it.
+        """
+        records = self.unresolved(older_than=older_than, limit=limit)
+        return build_plan(records, provider)
+
+    def apply_reconciliation(self, plan: Plan) -> Applied:
+        """Carry out a plan built by `plan_reconciliation`.
+
+        **Each record is re-read immediately before it is written**, and skipped
+        if it is no longer `UNKNOWN`. Between planning and applying, the process
+        that originally owned the key may have come back and recorded the real
+        outcome, and overwriting that with one inferred from the provider would
+        replace a fact with a guess.
+
+        That re-read narrows the window; it does not close it. There is no
+        compare-and-set in the `Store` contract — `complete` and `fail` write
+        unconditionally — so a record that changes between the re-read and the
+        write is still overwritten. Closing it properly needs a conditional
+        write primitive, which would be a change to every store. Said plainly
+        here because "reconciliation is safe" is the kind of claim that gets
+        believed, and this one has a bound on it.
+
+        A write that raises is recorded and the run continues. Stopping on the
+        first failure leaves the batch half-applied with no record of where it
+        got to, which is strictly worse than finishing and reporting.
+        """
+        completed = released = 0
+        stale: list[str] = []
+        failed: list[tuple[str, str]] = []
+
+        for step in plan.effective:
+            current = self.lookup(step.key)
+            if current is None or current.state is not State.UNKNOWN:
+                stale.append(step.key)
+                continue
+            stored = scoped(self.namespace, step.key)
+            try:
+                if step.action is Action.COMPLETE:
+                    self.store.complete(
+                        stored, step.response, retention_seconds=self.retention_seconds
+                    )
+                    completed += 1
+                else:
+                    # Released, not burned. The provider says the effect never
+                    # landed, so the right outcome is that a retry may run it —
+                    # a terminal failure would mean "this will never happen",
+                    # which is a different and unrecoverable claim.
+                    self.store.fail(stored, terminal=False)
+                    released += 1
+            except Exception as exc:
+                failed.append((step.key, f"{type(exc).__name__}: {exc}"))
+
+        return Applied(completed=completed, released=released, stale=stale, failed=failed)
 
     # -- internals ----------------------------------------------------------
 
