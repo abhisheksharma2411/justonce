@@ -184,6 +184,61 @@ def _sweep(args: argparse.Namespace, out: Any) -> int:
     return 0
 
 
+def _load_provider(target: str) -> Any:
+    """Import a reconciliation adapter, with the same contract as `--engine`."""
+    provider = load_engine(target, requires=("outcome_for",))
+    return provider
+
+
+def _reconcile(args: argparse.Namespace, out: Any) -> int:
+    try:
+        engine = load_engine(args.engine, requires=("unresolved", "now", "lookup"))
+    except EngineLoadError as exc:
+        print(f"justonce reconcile: {exc}", file=sys.stderr)
+        return 2
+    try:
+        provider = _load_provider(args.provider)
+    except EngineLoadError as exc:
+        print(f"justonce reconcile: --provider {exc}", file=sys.stderr)
+        return 2
+
+    older_than = None
+    if args.older_than is not None:
+        try:
+            older_than = parse_duration(args.older_than)
+        except ValueError as exc:
+            print(f"justonce reconcile: {exc}", file=sys.stderr)
+            return 2
+
+    plan = engine.plan_reconciliation(
+        provider, older_than=older_than, limit=args.limit
+    )
+    for step in plan.steps:
+        detail = step.error if step.error else (step.outcome.value if step.outcome else "")
+        print(f"{step.key}\t{step.action.value}\t{detail}", file=out)
+
+    counts = plan.counts()
+    summary = ", ".join(f"{action.value}={counts[action]}" for action in counts)
+    print(f"{len(plan)} record(s): {summary}", file=sys.stderr)
+
+    if not args.apply:
+        # The default. Nothing has been written, and the exit code says the
+        # plan was produced — not that anything was resolved.
+        print("dry run: nothing written. Pass --apply to carry this out.", file=sys.stderr)
+        return 0
+
+    result = engine.apply_reconciliation(plan)
+    print(
+        f"applied: completed={result.completed} released={result.released} "
+        f"skipped_stale={len(result.stale)} failed={len(result.failed)}",
+        file=sys.stderr,
+    )
+    for key, error in result.failed:
+        print(f"failed: {key}: {error}", file=sys.stderr)
+    # A write that failed is not a successful run, however many others landed.
+    return 1 if result.failed else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="justonce",
@@ -231,6 +286,38 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--engine", required=True, help=TARGET_HELP)
     inspect.add_argument("key", help="the idempotency key, in the caller's namespace")
     inspect.set_defaults(func=_inspect)
+
+    reconcile = sub.add_parser(
+        "reconcile",
+        help="resolve UNKNOWN records against a provider",
+        description=(
+            "Asks a provider adapter what happened to each unresolved key, "
+            "then prints the plan. Writes NOTHING unless --apply is passed: a "
+            "reconciliation tool that acts before you have read its plan is "
+            "not one you will run against production."
+        ),
+    )
+    reconcile.add_argument("--engine", required=True, help=TARGET_HELP)
+    reconcile.add_argument(
+        "--provider",
+        required=True,
+        help="import path of the reconciliation adapter, as package.module:attribute",
+    )
+    reconcile.add_argument(
+        "--older-than",
+        default=None,
+        help=(
+            "only records older than this, e.g. 30s, 15m, 1h. Worth setting: a "
+            "record that went UNKNOWN seconds ago may still be in flight."
+        ),
+    )
+    reconcile.add_argument("--limit", type=int, default=100, help="maximum records (default 100)")
+    reconcile.add_argument(
+        "--apply",
+        action="store_true",
+        help="carry out the plan. Without this the command is read-only.",
+    )
+    reconcile.set_defaults(func=_reconcile)
 
     return parser
 

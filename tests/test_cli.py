@@ -261,3 +261,167 @@ def test_sweep_does_not_demand_methods_it_never_calls(monkeypatch):
     _install(monkeypatch, "minimal_mod", engine=FakeEngine(removed=1))
     out = io.StringIO()
     assert main(["sweep", "--engine", "minimal_mod:engine"], out=out) == 0
+
+
+# -- reconcile (#23) ---------------------------------------------------------
+
+
+class _ReconEngine:
+    """Engine stand-in for the reconcile command."""
+
+    def __init__(self, plan, applied=None):
+        self._plan = plan
+        self._applied = applied
+        self.planned = 0
+        self.applied_calls = 0
+        self.older_than = "not called"
+
+    def unresolved(self, **_):  # pragma: no cover - load_engine only checks callable
+        return []
+
+    def now(self):
+        return 0.0
+
+    def lookup(self, key):  # pragma: no cover - same
+        return None
+
+    def plan_reconciliation(self, provider, *, older_than=None, limit=100):
+        self.planned += 1
+        self.older_than = older_than
+        return self._plan
+
+    def apply_reconciliation(self, plan):
+        self.applied_calls += 1
+        return self._applied
+
+
+class _Provider:
+    def outcome_for(self, record):  # pragma: no cover - never called by the stub
+        raise AssertionError("not reached")
+
+
+def _plan_of(*steps):
+    from justonce.reconcile import Plan
+
+    return Plan(steps=list(steps))
+
+
+def _step(key, action, outcome=None, error=None):
+    from justonce.reconcile import Step
+    from justonce.stores.base import State
+
+    return Step(key=key, state=State.UNKNOWN, outcome=outcome, action=action, error=error)
+
+
+def test_reconcile_defaults_to_a_dry_run(monkeypatch, capsys):
+    """No --apply means nothing is written, whatever the plan says."""
+    from justonce.reconcile import Action, Outcome
+
+    plan = _plan_of(_step("a", Action.COMPLETE, Outcome.APPLIED))
+    engine = _ReconEngine(plan)
+    _install(monkeypatch, "recon_app", engine=engine, provider=_Provider())
+    out = io.StringIO()
+
+    code = main(
+        ["reconcile", "--engine", "recon_app:engine", "--provider", "recon_app:provider"],
+        out=out,
+    )
+
+    assert code == 0
+    assert engine.planned == 1
+    assert engine.applied_calls == 0, "a dry run must not apply anything"
+    assert "dry run: nothing written" in capsys.readouterr().err
+    assert "a\tcomplete\tapplied" in out.getvalue()
+
+
+def test_reconcile_applies_only_when_asked(monkeypatch, capsys):
+    from justonce.reconcile import Action, Applied, Outcome
+
+    plan = _plan_of(_step("a", Action.COMPLETE, Outcome.APPLIED))
+    engine = _ReconEngine(plan, applied=Applied(completed=1))
+    _install(monkeypatch, "recon_app", engine=engine, provider=_Provider())
+
+    code = main(
+        [
+            "reconcile",
+            "--engine", "recon_app:engine",
+            "--provider", "recon_app:provider",
+            "--apply",
+        ],
+        out=io.StringIO(),
+    )
+
+    assert code == 0
+    assert engine.applied_calls == 1
+    assert "completed=1" in capsys.readouterr().err
+
+
+def test_reconcile_exits_nonzero_when_a_write_failed(monkeypatch, capsys):
+    """Some keys landing is not a successful run."""
+    from justonce.reconcile import Action, Applied, Outcome
+
+    plan = _plan_of(_step("a", Action.COMPLETE, Outcome.APPLIED))
+    engine = _ReconEngine(plan, applied=Applied(completed=0, failed=[("a", "StoreError: down")]))
+    _install(monkeypatch, "recon_app", engine=engine, provider=_Provider())
+
+    code = main(
+        [
+            "reconcile",
+            "--engine", "recon_app:engine",
+            "--provider", "recon_app:provider",
+            "--apply",
+        ],
+        out=io.StringIO(),
+    )
+
+    assert code == 1
+    assert "failed: a: StoreError: down" in capsys.readouterr().err
+
+
+def test_reconcile_rejects_a_provider_that_is_not_an_adapter(monkeypatch, capsys):
+    """Pointing --provider at the engine is the likeliest mistake."""
+    engine = _ReconEngine(_plan_of())
+    _install(monkeypatch, "recon_app", engine=engine)
+
+    code = main(
+        ["reconcile", "--engine", "recon_app:engine", "--provider", "recon_app:engine"],
+        out=io.StringIO(),
+    )
+
+    assert code == 2
+    assert "outcome_for" in capsys.readouterr().err
+
+
+def test_reconcile_parses_older_than(monkeypatch):
+    engine = _ReconEngine(_plan_of())
+    _install(monkeypatch, "recon_app", engine=engine, provider=_Provider())
+
+    main(
+        [
+            "reconcile",
+            "--engine", "recon_app:engine",
+            "--provider", "recon_app:provider",
+            "--older-than", "15m",
+        ],
+        out=io.StringIO(),
+    )
+
+    assert engine.older_than == 900.0
+
+
+def test_reconcile_rejects_a_bad_duration(monkeypatch, capsys):
+    engine = _ReconEngine(_plan_of())
+    _install(monkeypatch, "recon_app", engine=engine, provider=_Provider())
+
+    code = main(
+        [
+            "reconcile",
+            "--engine", "recon_app:engine",
+            "--provider", "recon_app:provider",
+            "--older-than", "1hr",
+        ],
+        out=io.StringIO(),
+    )
+
+    assert code == 2
+    assert "30s, 15m, 1h, 7d" in capsys.readouterr().err

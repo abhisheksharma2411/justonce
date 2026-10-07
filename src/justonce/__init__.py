@@ -44,6 +44,7 @@ from .errors import (
 )
 from .hooks import Hooks
 from .keys import fingerprint, operation_key
+from .reconcile import Action, Outcome, Plan, ReconciliationProvider, Step
 from .stores.base import Claim, Record, State, Store
 
 __version__ = "0.2.0"
@@ -51,6 +52,7 @@ __version__ = "0.2.0"
 __all__ = [
     "DEFAULT_RETENTION_SECONDS",
     "DEFAULT_TTL_SECONDS",
+    "Action",
     "AmbientTransactionError",
     "AsyncIdempotent",
     "AsyncStore",
@@ -65,11 +67,15 @@ __all__ = [
     "OnInFlight",
     "OnStoreUnavailable",
     "OperationInFlightError",
+    "Outcome",
+    "Plan",
+    "ReconciliationProvider",
     "Record",
     "ResponseCodec",
     "ResponseDecodeError",
     "Result",
     "State",
+    "Step",
     "Store",
     "StoreError",
     "ThreadedStore",
