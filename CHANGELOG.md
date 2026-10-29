@@ -41,6 +41,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`IdempotencyMiddleware`** — one `Idempotency-Key` header, deduplicated for a
+  whole ASGI application ([#10]):
+
+  ```python
+  from justonce.integrations.asgi import IdempotencyMiddleware
+  app.add_middleware(IdempotencyMiddleware, store=SqliteStore("effects.db"))
+  ```
+
+  Plain ASGI rather than Starlette's `BaseHTTPMiddleware`, so it imports nothing
+  outside the standard library and behaves the same under FastAPI, Starlette or
+  a hand-written app. A replay returns the stored status and body plus
+  `Idempotent-Replay: true`.
+
+  **A 5xx is not cached.** `cacheable` defaults to `status < 500`, and a
+  response that fails it releases the claim instead of recording it, so the
+  client's retry runs. Caching a 500 for the retention window turns one bad
+  minute into a key that can never succeed.
+
+  Only `store_headers` — `content-type` by default — is written to the ledger
+  and replayed, so a `Set-Cookie` is never handed to the next caller of that
+  key. The first, non-replayed response still carries every header the handler
+  set; the filter applies to the stored copy alone.
+
 - **`MemoryStore`** — a dict behind a lock, for unit-testing handlers without a
   database ([#9], [#62]). Passes the full conformance suite, the 24-thread claim
   race included, because an in-memory store that is not thread-safe passes a
@@ -171,6 +194,7 @@ conformance suite.
 [#62]: https://github.com/abhisheksharma2411/justonce/pull/62
 [#47]: https://github.com/abhisheksharma2411/justonce/issues/47
 [#63]: https://github.com/abhisheksharma2411/justonce/pull/63
+[#10]: https://github.com/abhisheksharma2411/justonce/issues/10
 [Unreleased]: https://github.com/abhisheksharma2411/justonce/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/abhisheksharma2411/justonce/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/abhisheksharma2411/justonce/releases/tag/v0.1.0
