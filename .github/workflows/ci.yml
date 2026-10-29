@@ -7,11 +7,19 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-latest is Ubuntu 26.04 now, and actions/python-versions has no 3.9
+    # build for it -- 3.9 went EOL before 26.04 shipped, so the newest 3.9.25
+    # artifacts stop at 24.04. The wheel still declares requires-python >= 3.9,
+    # so the job is pinned rather than dropped: dropping it would leave that
+    # claim untested instead of making it false.
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
         python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        include:
+          - python: "3.9"
+            os: ubuntu-24.04
 
     services:
       postgres:
