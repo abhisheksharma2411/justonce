@@ -44,6 +44,7 @@ from .errors import (
 )
 from .hooks import Hooks
 from .keys import fingerprint, operation_key
+from .logging import LoggingHooks
 from .reconcile import Action, Outcome, Plan, ReconciliationProvider, Step
 from .stores.base import Claim, Record, State, Store
 
@@ -64,6 +65,7 @@ __all__ = [
     "JustOnceError",
     "KeyReuseError",
     "KeyTooLongError",
+    "LoggingHooks",
     "OnInFlight",
     "OnStoreUnavailable",
     "OperationInFlightError",
