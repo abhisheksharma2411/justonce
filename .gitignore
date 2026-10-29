@@ -13,3 +13,8 @@ htmlcov/
 *.db-wal
 *.db-shm
 .DS_Store
+
+# justonce is a library: the resolved dependency set belongs to the
+# application that installs it. CI installs from pyproject on five
+# interpreters, so a lock file here would pin nothing that matters.
+uv.lock
