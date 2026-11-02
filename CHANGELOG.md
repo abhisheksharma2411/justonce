@@ -41,6 +41,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`justonce.integrations.flask`** — a Flask extension and a per-view
+  decorator ([#13]). `JustOnce(app, store=...)` puts one engine on the
+  application; `@idempotent_view` deduplicates a single route by its
+  `Idempotency-Key` header. A repeat never reaches the view and comes back with
+  `Idempotent-Replay: true`.
+
+  Opt-in per view rather than a `before_request`, because an application that
+  deduplicates every route is almost never what anyone wants and is hard to
+  notice going wrong. For the same reason a missing header is a `400` by
+  default here, where the ASGI middleware passes an unkeyed request through:
+  decorating a view is an explicit statement that *this* endpoint is not safe to
+  run twice. `require=False` covers the migration case.
+
+  A `5xx` is not recorded, so the client's retry runs the view again rather than
+  being answered with the same failure forever. Neither is a streamed or
+  `send_file` response: reading its body would drain the iterator the client is
+  about to be handed.
+
+  Only `store_headers` are recorded and replayed; everything else is
+  per-exchange. The live response is sent exactly as the view wrote it — the
+  filtering applies to the ledger's copy alone, so a first response does not
+  lose its `Set-Cookie`.
+
 - **`MemoryStore`** — a dict behind a lock, for unit-testing handlers without a
   database ([#9], [#62]). Passes the full conformance suite, the 24-thread claim
   race included, because an in-memory store that is not thread-safe passes a
@@ -158,6 +181,7 @@ request fingerprint, `UNKNOWN` state and reconciliation, and the store
 conformance suite.
 
 [#9]: https://github.com/abhisheksharma2411/justonce/issues/9
+[#13]: https://github.com/abhisheksharma2411/justonce/issues/13
 [#38]: https://github.com/abhisheksharma2411/justonce/pull/38
 [#39]: https://github.com/abhisheksharma2411/justonce/issues/39
 [#40]: https://github.com/abhisheksharma2411/justonce/issues/40
