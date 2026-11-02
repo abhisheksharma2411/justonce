@@ -57,6 +57,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A successful effect logs at `DEBUG` and a failed one at `WARNING`: one INFO
   line per charge would bury the events worth seeing.
 
+- **`justonce.tracing.TracingHooks`** — OpenTelemetry spans for idempotency
+  decisions ([#25]). A replayed call sets `justonce.deduplicated` on the span
+  the request already has, so "did this request do anything?" is answerable
+  from the request's own trace rather than inferred from a downstream call that
+  never happened. `key_reuse` and `unknown_recorded` set the span's status to
+  ERROR, because each leaves work for a human and is invisible everywhere else
+  in the trace.
+
+  The effect span is built after the fact from the duration `effect_finished`
+  already carries, so `Hooks` gains no `effect_started` callback and the money
+  path gains no second hook. The duration is exact rather than approximate; what
+  it cannot show is an effect that never finishes, which appears as a claim with
+  no span under it.
+
+  OpenTelemetry is an optional extra (`pip install justonce[otel]`) and nothing
+  imports it unless you import `justonce.tracing`. `TracingHooks` is deliberately
+  *not* re-exported from the top-level package, which would load the OTel API
+  for everybody.
+
+  `Record.response` and `request_hash` are never read, so a charge or an account
+  number cannot reach a trace backend; `hash_keys=True` also replaces the key,
+  which duplicates still group by.
+
 - **`justonce.integrations.flask`** — a Flask extension and a per-view
   decorator ([#13]). `JustOnce(app, store=...)` puts one engine on the
   application; `@idempotent_view` deduplicates a single route by its
@@ -197,6 +220,7 @@ request fingerprint, `UNKNOWN` state and reconciliation, and the store
 conformance suite.
 
 [#9]: https://github.com/abhisheksharma2411/justonce/issues/9
+[#25]: https://github.com/abhisheksharma2411/justonce/issues/25
 [#13]: https://github.com/abhisheksharma2411/justonce/issues/13
 [#38]: https://github.com/abhisheksharma2411/justonce/pull/38
 [#39]: https://github.com/abhisheksharma2411/justonce/issues/39

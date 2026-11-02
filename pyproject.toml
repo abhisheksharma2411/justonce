@@ -33,6 +33,7 @@ justonce = "justonce.cli:main"
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.1"]
 django = ["django>=4.2"]
+otel = ["opentelemetry-api>=1.20"]
 flask = ["flask>=2.2"]
 examples = ["fastapi>=0.115", "uvicorn>=0.30"]
 dev = [
@@ -40,6 +41,11 @@ dev = [
     "fastapi>=0.115",
     "flask>=2.2",
     "httpx>=0.27",
+    # The SDK, not just the API: the tracing tests assert against real spans,
+    # because OpenTelemetry's own rules (attribute types, a span ended twice,
+    # a start after an end) are what a mock would happily accept.
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
     "mypy>=1.8",
     "pytest>=7.4",
     "pytest-asyncio>=0.23",
