@@ -41,6 +41,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`LoggingHooks`** — answer "did this key dedupe?" from the log stream rather
+  than by querying the store ([#52]). It implements the existing `Hooks`
+  interface instead of adding a second event path, so logs and metrics see the
+  same events, and it imports nothing outside the standard library.
+
+  Every field goes into `extra`, so a JSON formatter emits real fields and a
+  plain one still prints a readable line. **Responses and payload fingerprints
+  are never logged.** `duplicate_suppressed` is handed a whole `Record`, whose
+  `response` holds whatever the effect returned; this reads `state`, `attempts`
+  and the timestamps off it and never touches `response`. `hash_keys=True`
+  additionally replaces the key with a truncated digest, for keys derived from
+  an email address or a customer reference.
+
+  A successful effect logs at `DEBUG` and a failed one at `WARNING`: one INFO
+  line per charge would bury the events worth seeing.
+
 - **`MemoryStore`** — a dict behind a lock, for unit-testing handlers without a
   database ([#9], [#62]). Passes the full conformance suite, the 24-thread claim
   race included, because an in-memory store that is not thread-safe passes a
@@ -171,6 +187,7 @@ conformance suite.
 [#62]: https://github.com/abhisheksharma2411/justonce/pull/62
 [#47]: https://github.com/abhisheksharma2411/justonce/issues/47
 [#63]: https://github.com/abhisheksharma2411/justonce/pull/63
+[#52]: https://github.com/abhisheksharma2411/justonce/issues/52
 [Unreleased]: https://github.com/abhisheksharma2411/justonce/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/abhisheksharma2411/justonce/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/abhisheksharma2411/justonce/releases/tag/v0.1.0
