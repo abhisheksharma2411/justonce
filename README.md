@@ -541,6 +541,38 @@ Temporal, Restate, DBOS and friends solve a broader problem, and solve it well �
 
 Use justonce when you want *one dangerous call* made safe this afternoon. Use a workflow engine when you need orchestration, timers, and long-running state.
 
+## Celery: tasks that are delivered more than once
+
+A Celery task is delivered at least once by design. With `acks_late` — which is
+the setting you want if losing work matters — a worker that dies mid-task hands
+the message back and another worker runs the body again. The visibility timeout
+does the same to a task that merely runs long.
+
+```python
+from justonce.integrations.celery import idempotent_task
+
+@app.task(acks_late=True)
+@idempotent_task(key=lambda order_id: operation_key("charge", order_id))
+def charge(order_id):
+    return provider.charge(order_id)
+```
+
+**The decorator goes under `@app.task`.** The other way round registers the
+bare function with Celery: nothing is deduplicated, nothing raises, and nothing
+anywhere says so. `register_check(app)` returns the names of tasks whose body is
+not wrapped — call it at startup and log or fail on what comes back.
+
+Omit `key=` and the key comes from Celery's task id, which deduplicates
+*redeliveries of one message* but not two publishes of the same intent:
+`charge.delay(order)` called twice gets two task ids and charges twice. Key on
+the order if that is what you meant.
+
+There is deliberately no "burn the key on failure" option. Celery owns the retry
+decision — `max_retries`, `autoretry_for`, the dead-letter queue — and a key
+burned here would silently disable all of it: the retry Celery schedules would
+arrive, find a terminal record, and return the failure without running. A
+raising body always releases the claim, `self.retry()` included.
+
 ## FastAPI payment example
 
 The copyable [`examples/fastapi_payment.py`](examples/fastapi_payment.py) endpoint accepts an
