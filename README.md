@@ -80,6 +80,7 @@ mode you are actually in.
 | `SqliteStore("path.db")` | single host — local dev, tests, a single-instance deployment | you're running more than one machine or worker process |
 | `PostgresStore` | a fleet of workers sharing state, no existing Django app | — |
 | `DjangoStore` | you already run Django and want to reuse its connection | you haven't read the transaction caveat above |
+| `SQLAlchemyStore(engine)` | you already own a SQLAlchemy `Engine`, or you're on MySQL/MariaDB | you're on Postgres with no `Engine` — `PostgresStore` is one layer fewer |
 | `MemoryStore()` | unit-testing a handler without a database | anything else — see below |
 
 `MemoryStore` is a dict behind a lock. It passes the full conformance suite
@@ -466,7 +467,7 @@ The key comes from the **initiating event or the client** — never from the lay
 
 ### Key length
 
-`SqliteStore` and `PostgresStore` store keys in unbounded `TEXT`, so length is not a concern. **MySQL is the exception**: the shipped DDL declares `key VARCHAR(255)`, and namespaced keys get long faster than you'd expect — `operation_key("charge", tenant_id, order_id, attempt_id)` with UUIDs is already past 140 characters.
+`SqliteStore` and `PostgresStore` store keys in unbounded `TEXT`, so length is not a concern. **MySQL is the exception**: the shipped DDL declares a bounded `VARCHAR` (`SQLAlchemyStore` uses `VARCHAR(191)`, since utf8mb4 is four bytes per character and InnoDB's index prefix limit is 767 bytes on the older row formats), and namespaced keys get long faster than you'd expect — `operation_key("charge", tenant_id, order_id, attempt_id)` with UUIDs is already past 140 characters.
 
 Over-length keys are refused rather than stored, because the alternative is worse than an error:
 
