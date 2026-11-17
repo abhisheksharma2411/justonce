@@ -34,6 +34,7 @@ The duplicates that matter are the irreversible ones: money moves, an email send
 ```bash
 pip install justonce                 # SQLite included, no dependencies
 pip install justonce[postgres]       # + Postgres store
+pip install justonce[redis]          # + Redis store
 pip install justonce[django]         # + Django store, uses your existing connection
 ```
 
@@ -81,6 +82,7 @@ mode you are actually in.
 | `PostgresStore` | a fleet of workers sharing state, no existing Django app | — |
 | `DjangoStore` | you already run Django and want to reuse its connection | you haven't read the transaction caveat above |
 | `SQLAlchemyStore(engine)` | you already own a SQLAlchemy `Engine`, or you're on MySQL/MariaDB | you're on Postgres with no `Engine` — `PostgresStore` is one layer fewer |
+| `RedisStore("redis://...")` | you already run Redis and would rather not put the claim on your primary database | you need `justonce ledger` — Redis has no index that answers it, so it raises instead of scanning |
 | `MemoryStore()` | unit-testing a handler without a database | anything else — see below |
 
 `MemoryStore` is a dict behind a lock. It passes the full conformance suite
