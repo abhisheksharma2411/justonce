@@ -573,6 +573,47 @@ burned here would silently disable all of it: the retry Celery schedules would
 arrive, find a terminal record, and return the failure without running. A
 raising body always releases the claim, `self.retry()` included.
 
+## AWS Lambda: invocations that repeat by design
+
+Lambda retries a failed invocation on its own, and every source in front of it
+redelivers. There are two wrappers, because an SQS batch is not one event:
+
+```python
+import justonce
+from justonce.integrations.aws_lambda import idempotent_handler, idempotent_sqs_handler
+from justonce.stores import PostgresStore
+
+# Module scope: this runs once per execution environment, not per invocation.
+justonce.configure(PostgresStore(os.environ["DSN"]))
+
+@idempotent_handler()                 # one key per invocation
+def on_object_created(event, context):
+    ...
+
+@idempotent_sqs_handler()             # one key per message
+def handle_order(record, context):
+    ...
+```
+
+`idempotent_handler` derives the key with `event_key`, which recognises
+EventBridge, S3, DynamoDB streams and API Gateway, and **refuses an event shape
+it does not know** rather than hashing the whole event — two separate events
+carrying the same payload would otherwise collapse onto one key and the second
+effect would never run.
+
+`idempotent_sqs_handler` calls your function once per message and returns the
+partial batch response. **Enable `ReportBatchItemFailures` on the event source
+mapping**, or SQS ignores it and deletes messages whose effect never ran. A
+message whose body raises gets its key released *and* its id reported, because
+one without the other fails silently in opposite directions: release without
+report deletes a message that never happened, and report without release means
+the redelivery finds the key taken and skips the body.
+
+Worth reading before you rely on the default: keying on `messageId`
+deduplicates *redeliveries of one message*, not two sends of one intent. If you
+need "this order is charged once however many times anything enqueues it", pass
+`key=` and build it from the order.
+
 ## FastAPI payment example
 
 The copyable [`examples/fastapi_payment.py`](examples/fastapi_payment.py) endpoint accepts an
