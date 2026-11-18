@@ -33,6 +33,14 @@ jobs:
           --health-interval 2s
           --health-timeout 5s
           --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
 
     steps:
       - uses: actions/checkout@v4
@@ -44,14 +52,15 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,postgres]"
+          pip install -e ".[dev,postgres,redis]"
 
       - name: Lint
         run: ruff check src tests
 
-      - name: Test (SQLite + Postgres conformance)
+      - name: Test (SQLite + Postgres + Redis conformance)
         env:
           JUSTONCE_POSTGRES_DSN: postgresql://postgres:postgres@localhost:5432/justonce_test
+          JUSTONCE_TEST_REDIS_URL: redis://localhost:6379/0
         run: pytest -q --cov=justonce --cov-report=term-missing
 
   types:
@@ -61,5 +70,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev,postgres]"
+      - run: pip install -e ".[dev,postgres,redis]"
       - run: mypy
